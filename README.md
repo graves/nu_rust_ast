@@ -32,9 +32,9 @@ jgs   ( /
   
 This script is your trusty sidekick for **harvesting symbols** from Rust projects into structured Nushell records. It uses `ast-grep` to:  
 - Extract **all Rust identifiers** (`fn`, `struct`, `enum`, `trait`, `mod`, etc.)  
-- Normalize metadata (file, span, visibility, Fully Qualified Paths)  
+- Normalize metadata (file, span, visibility, fully qualified paths)  
 - Capture **Rustdoc comments** and **full source code bodies** (when applicable).  
-- Estimate token count o source code and documentation blocks.
+- Estimate token count of source code and documentation blocks.
 
 Think of it as a Nushell first, *Rust AST explorer*. It’s your go-to tool for reverse-engineering codebases, analyzing symbol usage, and generating documentation from raw source files.  
 
