@@ -1,5 +1,5 @@
-# Rust Symbol Harvesting with Nushell: `rust-ast.nu`  
-**A CLI Tool for Structured Symbol Analysis in Rust Projects**
+# Rust Symbol Harvesting with Nushell 🌾
+**A CLI Tool for Structured Symbol Analysis of Rust Projects**
 
 ```
                    ,_  .--.
@@ -28,7 +28,7 @@ jgs   ( /
 
 ---
 
-## 🎉 *What This Does*
+## 🧑🏽‍🌾 *What This Does*
   
 This script is your trusty sidekick for **harvesting symbols** from Rust projects into structured Nushell records. It uses `ast-grep` to:  
 - Extract **all Rust identifiers** (`fn`, `struct`, `enum`, `trait`, `mod`, etc.)  
@@ -232,7 +232,7 @@ Input/output types:
 
 ---
 
-## 🧠 *Why This Matters*
+## 🙋🏻‍♀️ *Why This Matters*
   
 This tool is a game-changer for developers who want to:  
 - **Debug** complex symbol relationships (e.g., trait impls).  
