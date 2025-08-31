@@ -289,4 +289,4 @@ This script is provided under the **Creative Commons Zero v1.0 Universal**. Use 
 **Questions?** Send me an email.  
 
 ---  
-*Written by [Thomas Gentr](https://awfulsec.com) – a real human bean.* 🫛
+*Written by [Thomas Gentry](https://awfulsec.com) – a real human bean.* 🫛
