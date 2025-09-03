@@ -28,80 +28,108 @@ jgs   ( /
 
 ---
 
-## 🧑🏽‍🌾 *What This Does*
-  
-This script is your trusty sidekick for **harvesting symbols** from Rust projects into structured Nushell records. It uses `ast-grep` to:  
-- Extract **all Rust identifiers** (`fn`, `struct`, `enum`, `trait`, `mod`, etc.)  
-- Normalize metadata (file, span, visibility, fully qualified paths)  
-- Capture **Rustdoc comments** and **full source code bodies** (when applicable).  
-- Estimate token count of source code and documentation blocks.
+## 🎉 What This Does
 
-Think of it as a Nushell first, *Rust AST explorer*. It’s your go-to tool for reverse-engineering codebases, analyzing symbol usage, and generating documentation from raw source files.  
+`rust-ast` **harvests symbols** from Rust projects into structured Nushell records. It uses `ast-grep` to:
 
----
+- Extract **Rust items**: `fn`, `extern_fn`, `struct`, `enum`, `type`, `trait`, `impl`, `mod`, `macro_rules`, `const`, `static`, `use`
+- Normalize metadata (file, span, visibility, Fully Qualified Paths)
+- Capture **Rustdoc comments** and **full source bodies** (when applicable)
+- Estimate token counts for doc/comments and bodies
+- Map **function definitions to call sites** within your codebase
 
-## 🧠 *Core Features*  
-### 1. **Structured Symbol Tables**  
-Each row represents a Rust symbol with:  
-| Field             | Description                                                                                     |
-|------------------|------------------------------------------------------------------------------------------------|
-| `kind`           | Symbol type (e.g., `'fn'`, `'struct'`, `'mod'`, etc.)                                         |
-| `name`           | Best-effort symbol name (e.g., `'*'` for grouped-use leaves, or file/module name for synthetic `mod`s) |
-| `crate`          | Package name from `Cargo.toml` or `"crate"` as fallback                                         |
-| `module_path`    | List of strings (e.g., `[A, B]`) representing module hierarchy under `src/`                    |
-| `fqpath`         | Canonicalized path (e.g., `"crate::A::B"`) or UFCS for trait/impl methods                       |
-| `visibility`     | Visibility (`pub`, `private`, or nested: e.g., `"pub(crate)"`)                                 |
-| `file`           | Absolute/expanded file path                                                                    |
-| `span`           | Line/column spans (inclusive 1-based)                                                            |
-| `attrs`          | Reserved list (empty by default)                                                               |
-| `signature`      | Normalized signature/preamble (no body, e.g., `"pub fn foo()`)                                 |
-| `has_body`       | Boolean: true if the symbol has a body (`{ ... }`)                                             |
-| `async/unsafe/const` | Best-effort flags parsed from signature text (e.g., `"async"`, `"unsafe"`).                |
-| `abi/generics/where` | Captured metadata (e.g., generics, where clauses) if present                                  |
-| `doc`            | Verbatim Rustdoc comments or inner-file docs (`//!`, `/*! ... */`)                             |
-| `impl_of`        | For `'impl'` and `'fn'` inside impls: contains `trait_path?`, `type_path?`.                    |
-| `trait_items`    | Reserved list (empty by default)                                                               |
-| `reexports`      | Reserved list (empty by default)                                                               |
-| `body_text`      | Exact source text of the symbol if `want_body=true`.                                           |
-| `synthetic`      | Boolean: true for synthetic `'mod'` rows covering entire files (`src/foo.rs`, etc.)             |
-| `doc_tokens`     | Token estimate for the `doc` field (0 if empty).                                               |
-| `body_tokens`    | Token estimate for the `body_text` field (0 if empty).                                         |
----
-
-### 2. **Ast-grep Integration**
- 
-- Uses `ast-grep` with patterns and modifiers to parse Rust code.  
-- Utilizes `ast-grep`'s json output (`--json=stream`).  
-
-### 3. **Optimized for Large Projects**
-
-- Synthesizes "file mod" rows (for `src/mod.rs`) and includes full file text.  
-- Normalizes module paths from source layouts (`src/foo.rs` → `["foo"]`).  
-
-### 4. **Rustdoc & Token Counts**
-  
-- Extracts leading `///`/`#`[`...`] comments.  
-- Estimates token counts for `doc` and `body_text`.  
-
-### 5. **Call Site Analysis**
-  
-Identifies *call sites* with qualifiers (e.g., `Type::new(...)`) and attaches them to function definitions.  
+Think of it as a Nushell-first *Rust AST explorer*. Perfect for reverse-engineering, code analysis, and documentation generation.
 
 ---
 
-## 🧪 *How to Use*
-  
-### 1. **Install Dependencies**
-  
+## 🧠 Core Features
+
+### 1) Structured Symbol Tables
+
+Each row represents a Rust symbol with:
+
+| Field                | Description                                                                                                  |
+|----------------------|--------------------------------------------------------------------------------------------------------------|
+| `kind`               | `'fn'`, `'struct'`, `'enum'`, `'trait'`, `'impl'`, `'mod'`, …                                                |
+| `name`               | Best-effort symbol name (`'*'` for grouped-use leaves; file name for synthetic file `mod`s)                 |
+| `crate`              | Package name from `Cargo.toml` (fallback: `"crate"`)                                                         |
+| `module_path`        | Module path under `src/` as a list (e.g., `["foo","bar"]`)                                                   |
+| `fqpath`             | Canonical path (`crate::foo::Bar`, UFCS for trait methods when needed)                                       |
+| `visibility`         | `pub`, `private`, `pub(crate)`, etc.                                                                         |
+| `file`               | Absolute file path                                                                                           |
+| `span`               | `{ start_line, end_line, start_byte, end_byte }` (lines 1-based inclusive; bytes from ast-grep)             |
+| `attrs`              | Reserved (empty)                                                                                              |
+| `signature`          | Single-line preamble (no body)                                                                               |
+| `has_body`           | Whether the item has a `{ … }` body                                                                          |
+| `async/unsafe/const` | Bool flags parsed from signature                                                                             |
+| `abi/generics/where` | Extra meta when present                                                                                      |
+| `doc`                | Verbatim rustdoc or inner file docs                                                                          |
+| `impl_of`            | For `impl` and methods: `{ trait_path?, type_path? }`                                                        |
+| `trait_items`        | Reserved                                                                                                     |
+| `reexports`          | Reserved                                                                                                     |
+| `body_text`          | Exact matched text or whole file for synthetic file `mod`s                                                   |
+| `synthetic`          | True for synthetic file `mod` rows                                                                           |
+| `doc_tokens`         | Token estimate for `doc`                                                                                     |
+| `body_tokens`        | Token estimate for `body_text`                                                                               |
+
+### 2) `ast-grep` Integration
+
+- Uses `ast-grep --json=stream` to parse Rust
+- Patterns cover bodies, decls, generics, where clauses, etc.
+
+### 3) Optimized for Large Projects
+
+- Synthesizes “file module” rows for `src/foo.rs` / `src/foo/mod.rs`
+- Normalizes module paths directly from the filesystem layout
+
+### 4) Rustdoc & Token Counts
+
+- Extracts leading `///`, `#[doc = "..."]`, `/** ... */`, and file inner docs (`//!`, `/*! ... */`)
+- Token estimation mode configurable via `RUST_AST_TOKENIZER` (`words` default; `chars`; or `tiktoken` if you wire it up)
+
+### 5) Call Site Analysis
+
+- Finds simple call sites (`foo(...)`, `Type::foo(...)`, `recv.foo(...)`)
+- Attaches a `callers` list (as FQ paths) to function definitions
+
+---
+
+## 📦 Functions in this Script
+
+### `rust-ast [...paths]`
+Flat table of symbols and metadata (see fields above). Public entry point.
+
+### `rust-tree [...paths] [--include-use]`
+Builds a **nested** tree of minimal nodes for pretty printing:
 ```nu
-brew install ast-grep
-cd $"($nu.data-dir)/scripts"
-wget https://raw.github.com/graves/nu_rust_ast/tree/main/nu_rust_ast.nu
+{ kind, name, fqpath, children: [ ... ] }
 ```
 
-### 2. **Export the functions to your Nushell environment**
+### `print-symbol-tree [--fq-branches] [--tokens]`
+Pretty-prints the nested tree with aligned columns:
 
-Add the following to your Nushell configuration file `$nu.config-path`:
+- **Name** (ASCII tree branches + colorized name)
+- **Kind** (colorized + padded)
+- **FQ Path** (shown on leaves; optionally on branches)
+- **Tokens** (optional rightmost column showing `Body Tokens: N, Doc Tokens: M`)
+- Token sub-columns are **right-aligned** per number so all counts line up.
+
+Color is applied via `_paint-kind` using `ansi`. All alignment uses `_vlen`, which strips ANSI before measuring. Works even if your terminal doesn’t support color.
+
+---
+
+## 🔧 Installation
+
+```nu
+# ast-grep
+brew install ast-grep
+
+# Put the script somewhere Nushell will load it from, e.g.:
+cd $"($nu.data-dir)/scripts"
+curl -L https://raw.githubusercontent.com/graves/nu_rust_ast/refs/heads/main/rust_ast.nu -o $"($nu.data-dir)/scripts/rust_ast.nu"
+```
+
+Add to your Nushell config (`$nu.config-path`):
 
 ```nu
 use $"($nu.data-dir)/scripts/rust_ast.nu" *
@@ -109,184 +137,144 @@ use $"($nu.data-dir)/scripts/rust_ast.nu" *
 
 Reload your shell.
 
-### 3. Call the functions
-  
+> **Optional:** tokenization behavior  
+> - `RUST_AST_TOKENIZER=words` (default): fast, word-ish counting  
+> - `RUST_AST_TOKENIZER=chars`: ~1 token per 4 chars heuristic  
+> - `RUST_AST_TOKENIZER=tiktoken`: route to your `_token-count-via-tiktoken` if you implement it
+
+---
+
+## 🧪 Examples
+
+### 1) Explore call relationships
+
 ```nu
-λ rust-ast --help
-Public entry point.
-
-Usage:
-  > rust-ast ...(paths)
-
-Flags:
-  -h, --help: Display the help message for this command
-
-Parameters:
-  ...paths <string>
-
-Input/output types:
-  ╭───┬───────┬────────╮
-  │ # │ input │ output │
-  ├───┼───────┼────────┤
-  │ 0 │ any   │ any    │
-  ╰───┴───────┴────────╯
+rust-ast |
+  where kind == 'fn' |
+  select name fqpath callers |
+  sort-by fqpath
 ```
 
-```nu
-λ rust-ast
-| where kind == 'fn'
-| select name fqpath callers
-╭───┬────────────────────┬───────────────────────────┬──────────────────────────────╮
-│ # │        name        │          fqpath           │           callers            │
-├───┼────────────────────┼───────────────────────────┼──────────────────────────────┤
-│ 0 │ main               │ crate::main               │ [list 0 items]               │
-│ 1 │ process_files      │ crate::process_files      │ ╭───┬─────────────╮          │
-│   │                    │                           │ │ 0 │ crate::main │          │
-│   │                    │                           │ ╰───┴─────────────╯          │
-│ 2 │ write_row_to_file  │ crate::write_row_to_file  │ ╭───┬──────────────────────╮ │
-│   │                    │                           │ │ 0 │ crate::process_files │ │
-│   │                    │                           │ ╰───┴──────────────────────╯ │
-│ 3 │ fetch_with_backoff │ crate::fetch_with_backoff │ ╭───┬──────────────────────╮ │
-│   │                    │                           │ │ 0 │ crate::process_files │ │
-│   │                    │                           │ ╰───┴──────────────────────╯ │
-╰───┴────────────────────┴───────────────────────────┴──────────────────────────────╯
-```
+### 2) Inspect docs and bodies for a specific function
 
 ```nu
-λ rust-ast
-| where kind == 'fn' and name == 'process_files'
-| select doc doc_tokens body_text body_tokens
-╭─────┬──────────────────────────────────────────────────────────────────────────────────┬─────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────┬──────╮
-│   # │                                       doc                                        │ doc_tokens  │                                              body_text                                              │ ...  │
-├─────┼──────────────────────────────────────────────────────────────────────────────────┼─────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────┼──────┤
-│   0 │ /// Process `.txt` files under the given directory and sanitize their contents.  │         136 │ async fn process_files(                                                                             │  ... │
-│     │ ///                                                                              │             │     input_dir: &PathBuf,                                                                            │      │
-│     │ /// - Splits each file into ~500-token chunks.                                   │             │     output_dir_path: &str,                                                                          │      │
-│     │ /// - Submits each chunk to the model using [`fetch_with_backoff`].              │             │     config: AwfulJadeConfig,                                                                        │      │
-│     │ /// - Appends sanitized chunks to a YAML file named after the input file.        │             │ ) -> Result<(), String> {                                                                           │      │
-│     │ ///                                                                              │             │     // Initialize tokenizer for tokenization                                                        │      │
-│     │ /// # Parameters                                                                 │             │     let tokenizer = cl100k_base().map_err(|e| e.to_string())?;                                      │      │
-│     │ /// - `input_dir`: Path to directory containing `.txt` files.                    │             │     let max_tokens = 500;                                                                           │      │
-│     │ /// - `output_dir_path`: Path where YAML files are written.                      │             │                                                                                                     │      │
-│     │ /// - `config`: Configuration for model endpoint.                                │             │     // Configure text splitter to chunk content                                                     │      │
-│     │ ///                                                                              │             │     let splitter = TextSplitter::new(ChunkConfig::new(max_tokens).with_sizer(tokenizer));           │      │
-│     │ /// # Errors                                                                     │             │                                                                                                     │      │
-│     │ /// Returns `Err(String)` on filesystem, config, or API errors. Errors for       │             │     // Load template for sanitization                                                               │      │
-│     │ /// individual files/chunks are logged and do not abort other files.             │             │     let template = template::load_template("book_txt_sanitizer")                                    │      │
-│     │ ///                                                                              │             │         .await                                                                                      │      │
-│     │ /// # Example                                                                    │             │         .map_err(|e| format!("Template load error: {e}"))?;                                         │      │
-│     │ /// ```no_run                                                                    │             │                                                                                                     │      │
-│     │ /// # async fn demo(cfg: awful_aj::config::AwfulJadeConfig) {                    │             │     // Process each file in the input directory                                                     │      │
-│     │ /// let res = process_files(&"/tmp/books".into(), "/tmp/out", cfg).await;        │             │     for entry in fs::read_dir(input_dir).map_err(|e| e.to_string())? {                              │      │
-│     │ /// if let Err(err) = res {                                                      │             │         let entry = entry.map_err(|e| e.to_string())?;                                              │      │
-│     │ ///     eprintln!("Sanitization failed: {err}");                                 │             │         let path = &entry.path();                                                                   │      │
-│     │ /// }                                                                            │             │                                                                                                     │      │
-│     │ /// # }                                                                          │             │         // Check if the file is a `.txt` text file                                                  │      │
-│     │                                                                                  │             │         if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("txt") {             │      │
-│     │                                                                                  │             │             let filename = path.file_name().unwrap().to_string_lossy();                             │      │
-│     │                                                                                  │             │             let mut yaml_path = format!("{}/{}.yaml", output_dir_path, filename);                   │      │
-│     │                                                                                  │             │                                                                                                     │      │
-│     │                                                                                  │             │             // Open YAML file for writing                                                           │      │
-│     │                                                                                  │             │             let mut file = fs::OpenOptions::new()                                                   │      │
-│     │                                                                                  │             │                 .create(true)                                                                       │      │
-│     │                                                                                  │             │                 .append(true)                                                                       │      │
-│     │                                                                                  │             │                 .open(&yaml_path)                                                                   │      │
-│     │                                                                                  │             │                 .map_err(|e| e.to_string())?;                                                       │      │
-│     │                                                                                  │             │                                                                                                     │      │
-│     │                                                                                  │             │             // Write YAML header                                                                    │      │
-│     │                                                                                  │             │             writeln!(file, "chunks:").map_err(|e| e.to_string())?;                                  │      │
-│     │                                                                                  │             │                                                                                                     │      │
-│     │                                                                                  │             │             // Read and process the text content                                                    │      │
-│     │                                                                                  │             │             let contents = fs::read_to_string(&path).map_err(|e| e.to_string())?;                   │      │
-│     │                                                                                  │             │             let chunks: Vec<_> = splitter.chunks(&contents).collect();                              │      │
-│     │                                                                                  │             │                                                                                                     │      │
-│     │                                                                                  │             │             // Process each chunk                                                                   │      │
-│     │                                                                                  │             │             for chunk in chunks {                                                                   │      │
-│     │                                                                                  │             │                 let book_chunk = fetch_with_backoff(&config, &chunk, &template)                     │      │
-│     │                                                                                  │             │                     .await                                                                          │      │
-│     │                                                                                  │             │                     .map_err(|e| e.to_string())?;                                                   │      │
-│     │                                                                                  │             │                                                                                                     │      │
-│     │                                                                                  │             │                 if let Some(sanitized_text) = book_chunk {                                          │      │
-│     │                                                                                  │             │                     // Write sanitized content to YAML                                              │      │
-│     │                                                                                  │             │                     write_row_to_file(sanitized_text, &mut yaml_path).map_err(|e| e.to_string())?;  │      │
-│     │                                                                                  │             │                 }                                                                                   │      │
-│     │                                                                                  │             │             }                                                                                       │      │
-│     │                                                                                  │             │         }                                                                                           │      │
-│     │                                                                                  │             │     }                                                                                               │      │
-│     │                                                                                  │             │                                                                                                     │      │
-│     │                                                                                  │             │     Ok(())                                                                                          │      │
-│     │                                                                                  │             │ }                                                                                                   │      │
-╰─────┴──────────────────────────────────────────────────────────────────────────────────┴─────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────┴──────╯
+rust-ast |
+  where kind == 'fn' and name == 'process_files' |
+  select doc doc_tokens body_text body_tokens
 ```
+```text
+╭──────┬──────────────────────────────────────────────────────────────────────────────┬───────────────┬─────────────────────────────────────────────────────────────────────────────────────────────┬───────────────╮
+│    # │                                     doc                                      │  doc_tokens   │                                          body_text                                          │  body_tokens  │
+├──────┼──────────────────────────────────────────────────────────────────────────────┼───────────────┼─────────────────────────────────────────────────────────────────────────────────────────────┼───────────────┤
+│    0 │     /// Query the index for the `top_k` nearest vectors to `vector`.         │            60 │ pub fn search(&self, vector: &[f32], top_k: usize) -> Result<Vec<usize>, &'static str> {    │            24 │
+│      │     ///                                                                      │               │         if vector.len() != self.dimension {                                                 │               │
+│      │     /// # Parameters                                                         │               │             return Err("dimension mismatch");                                               │               │
+│      │     /// - `vector`: Query vector; must have length `dimension`.              │               │         }                                                                                   │               │
+│      │     /// - `top_k`: Number of nearest IDs to return.                          │               │         Ok(self.index.search(vector, top_k))                                                │               │
+│      │     ///                                                                      │               │     }                                                                                       │               │
+│      │     /// # Returns                                                            │               │                                                                                             │               │
+│      │     /// A `Vec<usize>` of IDs sorted by increasing distance (best first).    │               │                                                                                             │               │
+│      │     ///                                                                      │               │                                                                                             │               │
+│      │     /// # Errors                                                             │               │                                                                                             │               │
+│      │     /// - `"dimension mismatch"` if `vector.len() != self.dimension`.        │               │                                                                                             │               │
+╰──────┴──────────────────────────────────────────────────────────────────────────────┴───────────────┴─────────────────────────────────────────────────────────────────────────────────────────────┴───────────────
+````
+
+### 3) Show signatures and body token counts
 
 ```nu
-λ rust-ast
-| where kind == 'fn' and name == 'process_files'
-| select signature body_tokens
-╭───┬──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┬─────────────╮
-│ # │                                                      signature                                                       │ body_tokens │
-├───┼──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┼─────────────┤
-│ 0 │ async fn process_files( input_dir: &PathBuf, output_dir_path: &str, config: AwfulJadeConfig, ) -> Result<(), String> │         186 │
-╰───┴──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┴─────────────╯
+rust-ast |
+  where kind == 'fn' and name == 'process_files' |
+  select signature body_tokens
+```
+```text
+╭───┬────────────────────────────────────────────────────────────────────────────────────────┬─────────────╮
+│ # │                                       signature                                        │ body_tokens │
+├───┼────────────────────────────────────────────────────────────────────────────────────────┼─────────────┤
+│ 0 │ pub fn search(&self, vector: &[f32], top_k: usize) -> Result<Vec<usize>, &'static str> │          24 │
+╰───┴────────────────────────────────────────────────────────────────────────────────────────┴─────────────╯
+```
+
+### 4) Print a **colorized** symbol tree
+
+```nu
+rust-tree | print-symbol-tree
+```
+![Print Symbol Tree Screenshot](./print-symbol-tree.png)
+
+### 5) Take advantage of **Nushell's built in regex matching** inside queries
+
+```nu
+ rust-ast |
+  where kind == 'fn' and name =~ 'test_' |
+  select signature body_tokens
+```
+```text
+╭───┬────────────────────────────────────────────────────────────┬─────────────╮
+│ # │                         signature                          │ body_tokens │
+├───┼────────────────────────────────────────────────────────────┼─────────────┤
+│ 0 │ async fn test_create_client()                              │          19 │
+│ 1 │ async fn test_prepare_messages()                           │          68 │
+│ 2 │ fn test_load_config_valid_file()                           │          88 │
+│ 3 │ fn test_load_config_invalid_file()                         │           9 │
+│ 4 │ fn test_load_config_invalid_format()                       │          18 │
+│ 5 │ async fn test_load_template_valid_file()                   │          99 │
+│ 6 │ async fn test_load_template_invalid_file()                 │          15 │
+│ 7 │ async fn test_load_template_invalid_format()               │          83 │
+│ 8 │ async fn test_vector_store() -> Result<(), Box<dyn Error>> │          51 │
+╰───┴────────────────────────────────────────────────────────────┴─────────────╯
+```
+
+### 6) Show **token counts** with aligned sub-columns in the symbol tree
+
+```nu
+rust-tree | print-symbol-tree --tokens
 ```
 
 ---
 
-## 🙋🏻‍♀️ *Why This Matters*
-  
-This tool is a game-changer for developers who want to:  
-- **Debug** complex symbol relationships (e.g., trait impls).  
-- **Generate docs** from raw source files.  
-- **Analyze code structure** for refactoring or performance tuning.  
+## 🙋🏻‍♀️ Why This Matters
 
-It’s a *slightly-hacky, basically reliable* tool that can answer the questions:
+Use it to:
 
-> "What is this?", "Where did it come from?", "What does it do?","How good is it?", "Is it documented?", "What's it related to?"
+- **Debug** complex relationships (trait impls, method resolution)
+- **Generate docs** from raw source
+- **Analyze structure** for refactors and performance work
 
-with actionable metadata. 
+It helps answer the questions:
 
----
+> "What is this?", "Where did it come from?", "What does it do?", "Is it documented?", "What’s it related to?"
 
-## 🧩 *Limitations & Tips*
-
-- **Performance**: For large crates, consider filtering patterns to reduce output.  
-- **Module Paths**: Synthesized `mod` rows are generated based on file structure, not actual imports.  
-- **Ast-grep**: Requires `ast-grep` to be installed and accessible in your PATH.  
+…with actionable metadata.
 
 ---
 
-## 🎯 *Example Use Case*
-  
-```nu
-# Analyze all public functions in a crate
-rust-ast ./my_crate |
-  where kind = 'fn' and visibility = 'public' |
-  sort -by fqpath
-```
+## 🧩 Limitations & Tips
+
+- **Performance:** On huge crates, filter early (e.g., `where kind == 'fn'`) or scope paths.
+- **Module Paths:** File-based `mod` rows reflect filesystem layout, not necessarily `use` resolution.
+- **ANSI:** We color via Nushell’s `ansi` command. Spacing is computed on **stripped** strings, so alignment holds even with color.
+- **Token counts:** Heuristic by default unless you wire up `_token-count-via-tiktoken`.
 
 ---
 
-## 🚀 *Bonus: Call Site Tracking*
-
-The script automatically maps function definitions to their *call sites*, including qualified paths (e.g., `Type::method(...)`). This is especially useful for tracking how *traits* or *static methods* are used across your codebase.  
-
----
-
-## 📚 *Further Reading*
+## 📚 Further Reading
 
 - [Ast-grep Documentation](https://ast-grep.github.io/reference/cli.html)  
-- [Nushell Language Reference](https://www.nushell.sh/commands/)  
+- [Nushell Commands](https://www.nushell.sh/commands/)  
 
 ---
 
-## 📦 *License*
-  
-This script is provided under the **Creative Commons Zero v1.0 Universal**. Use it wisely, meaning (document your code with this, LLMs are good at that).  
+## 📄 License
 
---- 
+Creative Commons Zero v1.0 Universal (CC0-1.0).  
+If you use this to document your code, high-five ✋
 
-**Contributing?** Feel free to open pull requests or file issues on the repository.  
-**Questions?** Send me an email.  
+---
 
----  
-*Written by [Thomas Gentry](https://awfulsec.com) – a real human bean.* 🫛
+## 🤝 Contributing / Questions
+
+PRs and issues welcome.  
+Questions? Ping me via email.
+
+— *Written by [Thomas Gentry](https://awfulsec.com) – a real human bean.* 🫛

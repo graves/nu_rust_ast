@@ -1,6 +1,5 @@
-
 # =============================================================================
-# rust_ast.nu — Rust symbol harvesting with ast-grep (CLI-only, --json=stream)
+# rust-ast — Rust symbol harvesting with ast-grep (CLI-only, --json=stream)
 # =============================================================================
 #
 # WHAT THIS DOES
@@ -67,6 +66,116 @@
 # $X?   optional capture
 #
 # =============================================================================
+export def rust-ast [...paths:string] {
+  [
+    (rust-fn-records ...$paths)
+    (rust-extern-fn-records ...$paths)
+    (rust-struct-records ...$paths)
+    (rust-enum-records ...$paths)
+    (rust-type-records ...$paths)
+    (rust-trait-records ...$paths)
+    (rust-impl-records ...$paths)
+    (rust-mod-records ...$paths)
+    (rust-file-mod-records ...$paths)
+    (rust-macro-records ...$paths)
+    (rust-const-records ...$paths)
+    (rust-static-records ...$paths)
+    (rust-use-records ...$paths)
+  ]
+  | flatten
+  | _attach_impl_to_fns
+  | _uniq-records
+  | _attach_callers
+}
+
+# # Nested structure of symbols — MINIMAL payload (kind, name, fqpath, children).
+# This is exactly what `print-symbol-tree` expects to render/align/paint columns.
+export def rust-tree [
+  ...paths:string
+  --include-use
+] {
+  let rows_all  = (rust-ast ...$paths)
+  let rows_base = if $include_use { $rows_all } else { $rows_all | where kind != 'use' }
+
+  # Build parent→children adjacency and a minimal index
+  let edges = (_build-symbol-edges $rows_base)
+  let idx   = (_rows-index $rows_base)
+
+  # Build minimal children under 'crate'
+  let root_kids_fq = (_children-for $edges 'crate')
+  let root_kids    = (
+    $root_kids_fq
+    | each {|cfq| _build-subtree $idx $edges $cfq }
+    | where {|x| (($x | describe) =~ '^record<') }
+  )
+
+  # Minimal root record for output (only one list-typed column: `children`)
+  let root_rec = {
+    kind: 'mod'
+    name: 'crate'
+    fqpath: 'crate'
+    children: $root_kids
+  }
+
+  [ $root_rec ]
+}
+
+# =============================================================================
+# print-symbol-tree — Pretty-print a nested Rust symbol tree with columns
+# =============================================================================
+# Works with the nested output from `rust-tree`.
+#
+# Columns:
+#   - Name (tree/ASCII branches + symbol name; name text is colorized by kind)
+#   - Kind (colorized and padded; e.g., fn, struct, enum, impl, mod, …)
+#   - FQ Path (shown for leaves; with `--fq-branches` also shown on branches)
+#   - Tokens (optional; with `--tokens`, shows "Body Tokens: N, Doc Tokens: M")
+#
+# Color:
+#   Names and kinds are colorized via `_paint-kind`, which uses `ansi`.
+#   Column widths are computed using `_vlen`, which strips ANSI codes so
+#   alignment remains correct even when color is enabled.
+#
+# FQ Path formatting:
+#   FQ paths are printed as plain text (no brackets).
+#
+# Usage:
+#   rust-tree | print-symbol-tree
+#   rust-tree | print-symbol-tree --fq-branches
+#   rust-tree | print-symbol-tree --tokens
+#   rust-tree | print-symbol-tree --fq-branches --tokens
+#
+# Options:
+#   --fq-branches    Show fqpath on branch nodes too (defaults to leaves only).
+#   --tokens         Add a rightmost column with body/doc token counts.
+#
+# Notes:
+#   - This command expects a *nested* node (or list of nodes) from `rust-tree`.
+#     It tolerates a single record, a list/table of records, or a JSON string.
+#   - If your terminal or platform doesn't support ANSI, you'll still get
+#     correct spacing (we measure visible length with `ansi strip`).
+# =============================================================================
+export def print-symbol-tree [
+  --fq-branches
+  --tokens                     # <-- new flag
+] {
+  let input = $in
+  let roots = (_roots-of $input)
+  if ($roots | is-empty) {
+    error make { msg: "print-symbol-tree: input contains no records" }
+  }
+
+  let rows = (
+    $roots
+    | each {|r| _collect-rows $r [] true }
+    | flatten
+  )
+
+  let tok_idx = if $tokens { _build-token-index } else { null }
+
+  _print-with-columns $rows ($fq_branches | default false) $tok_idx
+}
+
 
 # ---------- helpers -----------------------------------------------------------
 
@@ -160,7 +269,7 @@ def _sigline [text: string] {
 
 # ---- sg I/O helpers ----------------------------------------------------------
 
-# Run ast-grep safely (returns error if neither `sg` nor `ast-grep` works).
+# Run ast-grep safely (returns error if neither `sg` nor `ast-grep`) works.
 def _run_sg [...args:string] {
   try {
     ^sg ...$args
@@ -416,14 +525,13 @@ def _attach_impl_to_fns [rows?: list<record>] {
 }
 
 # Call sites with qualifiers captured when present
-# Call sites with qualifiers (when present) without piping through 'nothing'
 def _rust-call-sites-on [targets:list<string>] {
   let files = ($targets | where {|f| ($f | default null) != null } | uniq)
 
   let pats = [
-    '$N($$$A)'        # plain: foo(...)
-    '$Q::$N($$$A)'    # qualified/assoc/UFCS: path::to::foo(...), Type::new(...)
-    '$RECV.$N($$$A)'  # method: recv.foo(...)
+    '$N($$$A)'
+    '$Q::$N($$$A)'
+    '$RECV.$N($$$A)'
   ]
 
   mut out = []
@@ -435,7 +543,6 @@ def _rust-call-sites-on [targets:list<string>] {
 
           let n = ($s | get -i N | default {} | get -i text | default null)
           if $n == null { null } else {
-            # Build 'qual' via if/else, never piping from 'nothing'
             let has_q    = (($s | get -i Q | default null)    != null)
             let has_recv = (($s | get -i RECV | default null) != null)
             let qual_val = if $has_q { ($s | get -i Q    | get -i text | default '') } else if $has_recv { ($s | get -i RECV | get -i text | default '') } else ''
@@ -461,13 +568,19 @@ def _rust-call-sites-on [targets:list<string>] {
 }
 
 # rows: the full table you already produce
-# Accept rows from either an explicit arg or the pipeline
 # Accept rows from arg or pipeline and attach a disambiguated 'callers' list
 def _attach_callers [rows?: list<record>] {
-  let rows = if ($rows | is-empty) { $in } else { $rows }
+  let rows0 = if ($rows | is-empty) { $in } else { $rows }
+  let rows = ($rows0 | where {|r| ($r | describe) =~ '^record<' })
 
-  let fns   = ($rows | where kind == 'fn')
-  let files = ($rows | get file | where {|f| $f != null } | uniq)
+  let fns = ($rows | where {|r| ($r | get -i kind | default '') == 'fn' })
+
+  let files = (
+    $rows
+    | each {|r| ($r | get -i file | default null) }
+    | where {|f| $f != null }
+    | uniq
+  )
 
   let calls    = (_rust-call-sites-on $files)
   let fn_index = (_index-fns-by-file $fns)
@@ -479,7 +592,10 @@ def _attach_callers [rows?: list<record>] {
         let caller = (_enclosing-fn $fn_index $c.file ($c.span.start_byte | default 0) ($c.span.end_byte | default 0))
         if $caller == null { null } else {
           let target = (_resolve-call $idx $fns $c $caller)
-          if $target == null { null } else { { callee_fq: $target.fqpath, caller_fq: $caller.fqpath } }
+          if $target == null { null } else {
+            { callee_fq: ($target | get -i fqpath | default '')
+            , caller_fq: ($caller | get -i fqpath | default '') }
+          }
         }
       }
     | where {|x| $x != null }
@@ -489,16 +605,33 @@ def _attach_callers [rows?: list<record>] {
     $pairs
     | group-by callee_fq
     | transpose fq callers
-    | each {|g| { fq: $g.fq, callers: ($g.callers | get caller_fq | uniq | sort) } }
+    | each {|g|
+        { fq: $g.fq
+        , callers: ($g.callers | get caller_fq | where {|v| ($v | default '') != '' } | uniq | sort) }
+      }
   )
 
   $rows
   | each {|r|
-      if $r.kind != 'fn' { $r } else {
-        let ent = ($callee_to_callers | where fq == $r.fqpath | get 0?)
-        ($r | upsert callers (if $ent == null { [] } else { $ent.callers }))
+      let t = ($r | describe)
+      if ($t =~ '^record<') {
+        let kind = ($r | get -i kind | default '')
+        if $kind != 'fn' {
+          $r
+        } else {
+          let fq  = ($r | get -i fqpath | default '')
+          let ent = ($callee_to_callers | where fq == $fq | get 0?)
+          if ( ($ent | describe) =~ '^record<' ) {
+            ($r | upsert callers ($ent.callers | default []))
+          } else {
+            ($r | upsert callers [])
+          }
+        }
+      } else {
+        null
       }
     }
+  | where {|x| $x != null }
 }
 
 # Find smallest enclosing fn for a call site (same file; span containment)
@@ -532,7 +665,7 @@ def _index-fns-by-file [fns:list<record>] {
     }
 }
 
-# Group functions by quick keys we’ll use for resolution
+# Group functions by quick keys we'll use for resolution
 def _build-fn-indexes [fns:list<record>] {
   let by_fqpath = ($fns | group-by fqpath | transpose key vals)
 
@@ -558,7 +691,7 @@ def _build-fn-indexes [fns:list<record>] {
 # Resolve a callee to *one* function row (best-effort heuristics)
 def _resolve-call [
   idx: record,
-  fns: list<record>,   # pass only fn rows (not all rows)
+  fns: list<record>,
   call: record,
   caller_fn?: record
 ] {
@@ -566,7 +699,6 @@ def _resolve-call [
   let qual = ($call.qual | default '')
   let kind = ($call.kind | default 'plain')
 
-  # Safely read optional fields from caller_fn
   let caller_impl_ty = (
     if ($caller_fn | describe) =~ '^nothing' {
       ''
@@ -582,14 +714,12 @@ def _resolve-call [
     }
   )
 
-  # 0) Exact-like: call already fully qualified to crate::...::name
   if ($qual | str starts-with 'crate::') {
     let tail = $"($qual)::($name)"
     let exact = ($idx.by_fqpath | where key == $tail | get 0? | get -i vals | default [])
     if (not ($exact | is-empty)) { return ($exact | get 0) }
   }
 
-  # 1) Qualified (assoc/UFCS) like Type::name or path::to::Type::name
   if ($kind == 'qualified' and ($qual | str contains '::')) {
     let tail = $"($qual)::($name)"
     let cand1 = ($fns | where {|r| ($r.fqpath | default '' | str ends-with $tail) })
@@ -600,19 +730,16 @@ def _resolve-call [
     if (not ($cand2 | is-empty)) { return ($cand2 | get 0).row }
   }
 
-  # 2) Method call: prefer same-impl method
   if ($kind == 'method' and $caller_impl_ty != '') {
     let key = $"($caller_impl_ty)::($name)"
     let cand3 = ($idx.impl_methods | where key == $key | get 0? | get -i vals | default [])
     if (not ($cand3 | is-empty)) { return ($cand3 | get 0).row }
   }
 
-  # 3) Same-module free fn
   let key4 = $"($caller_mod)::($name)"
   let cand4 = ($idx.free_fns | where key == $key4 | get 0? | get -i vals | default [])
   if (not ($cand4 | is-empty)) { return ($cand4 | get 0).row }
 
-    # 3b) Same-module free fn by name (only if unique in that module)
   let cand_mod = (
     $fns
     | where name == $name
@@ -622,7 +749,6 @@ def _resolve-call [
     return ($cand_mod | get 0)
   }
 
-  # 4) Fallback by name (only if unique crate-wide)
   let cand5 = ($fns | where name == $name)
   if ($cand5 | length) == 1 {
     return ($cand5 | get 0)
@@ -1308,30 +1434,351 @@ export def rust-use-records [...paths:string] {
   $out | reduce -f [] {|batch, acc| $acc | append $batch } | _uniq-records
 }
 
-# ---------- Aggregator --------------------------------------------------------
-export def rust-ast-records [...paths:string] {
-  [
-    (rust-fn-records ...$paths)
-    (rust-extern-fn-records ...$paths)
-    (rust-struct-records ...$paths)
-    (rust-enum-records ...$paths)
-    (rust-type-records ...$paths)
-    (rust-trait-records ...$paths)
-    (rust-impl-records ...$paths)
-    (rust-mod-records ...$paths)
-    (rust-file-mod-records ...$paths)
-    (rust-macro-records ...$paths)
-    (rust-const-records ...$paths)
-    (rust-static-records ...$paths)
-    (rust-use-records ...$paths)
-  ]
-  | flatten
-  | _attach_impl_to_fns
-  | _uniq-records
-  | _attach_callers         # ← add this
+# ---------- nesting helpers (for rust-tree) ----------------------------------
+
+def _index-by-fq [rows:list<record>] {
+  $rows
+  | where {|r| ($r | get -i fqpath | default '') != '' }
+  | group-by fqpath
+  | transpose fq rows
 }
 
-# Public entry point.
-export def rust-ast [...paths:string] {
-  rust-ast-records ...$paths
+# Build parent→children edges (each as fq strings)
+def _build-symbol-edges [rows:list<record>] {
+  let keyed = ($rows | where {|r| ($r | get -i fqpath | default '') != '' })
+
+  let parent_of = {|fq|
+    if $fq == 'crate' { null } else {
+      let parts = ($fq | split row '::')
+      let len = ($parts | length)
+      if $len <= 1 { null } else { ($parts | take ($len - 1) | str join '::') }
+    }
+  }
+
+  $keyed
+  | each {|r|
+      let fq = ($r | get -i fqpath | default '')
+      let p  = (do $parent_of $fq)
+      if $p == null or $p == $fq { null } else { { parent: $p, child: $fq } }
+    }
+  | where {|e| $e != null }
+  | group-by parent
+  | transpose parent children
+  | each {|g| { parent: $g.parent, children: ($g.children | get child | uniq | sort) } }
 }
+
+def _paint-kind [kind:string, text:string] {
+  let t = ($text | default "")
+  match $kind {
+    "mod"        => $"(ansi blue)($t)(ansi reset)"
+    "fn"         => $"(ansi green)($t)(ansi reset)"
+    "extern_fn"  => $"(ansi light_green)($t)(ansi reset)"
+    "struct"     => $"(ansi magenta)($t)(ansi reset)"
+    "enum"       => $"(ansi putple)($t)(ansi reset)"
+    "trait"      => $"(ansi cyan)($t)(ansi reset)"  # or 'purple' (alias)
+    "impl"       => $"(ansi yellow)($t)(ansi reset)"
+    "const"      => $"(ansi light_red)($t)(ansi reset)"
+    "static"     => $"(ansi light_red)($t)(ansi reset)"
+    "macro_rules" => $"(ansi dark_gray)($t)(ansi reset)"  # or purple
+    "use"        => $"(ansi white_dimmed)($t)(ansi reset)"  # “dim” style
+    _            => $t
+  }
+}
+
+# Build a nested node: take the canonical row for `fq` and attach `children: [...]`
+def _nest-node [
+  rows:list<record>,
+  edges:list<record<parent: string, children: list<string>>>,
+  index:list<record<fq: string, rows: list<record>>>,
+  fq:string
+] {
+  let r0 = (
+    $index
+    | where fq == $fq
+    | get 0?
+    | get -i rows
+    | get 0?
+    | default null
+  )
+
+  let kids = (
+    $edges
+    | where parent == $fq
+    | get 0?
+    | get -i children
+    | default []
+  )
+
+  let children = $kids
+    | each {|cfq| _nest-node $rows $edges $index $cfq }
+
+  if $r0 == null {
+    { kind: 'node', name: ($fq | split row '::' | last), fqpath: $fq, children: $children }
+  } else {
+    $r0 | upsert children $children
+  }
+}
+
+# --- helpers for nested build (no flatten) ------------------------------------
+
+# Build an index of MINIMAL rows (only fields the printer needs).
+def _rows-index [rows: list<record>] {
+  $rows
+  | reduce -f {} {|r, acc|
+      let fq = ($r.fqpath | default '')
+      if $fq == '' {
+        $acc
+      } else {
+        # store minimal payload; avoid other list-typed columns
+        let minimal = {
+          kind:   ($r.kind   | default '')
+          name:   ($r.name   | default '')
+          fqpath: $fq
+          children: []  # placeholder; we'll fill this when we build the tree
+        }
+        $acc | upsert $fq $minimal
+      }
+    }
+}
+
+# Safely get child fq list for a parent from edges structure
+def _children-for [edges: list<record<parent: string, children: list<string>>>, parent_fq: string] {
+  $edges | where parent == $parent_fq | get 0? | get -i children | default []
+}
+
+# Recursive builder: construct a fresh record (avoid upsert-on-record issues)
+def _build-subtree [idx: record, edges: list<record>, fq: string] {
+  let self = (try { $idx | get $fq } catch { null })
+  if $self == null {
+    null
+  } else {
+    let kids_fq = (_children-for $edges $fq)
+    let kids = (
+      $kids_fq
+      | each {|cfq| _build-subtree $idx $edges $cfq }
+      | where {|x| (($x | describe) =~ '^record<') }
+    )
+  {
+    kind:   ($self.kind   | default '')
+    name:   ($self.name   | default '')
+    fqpath: ($self.fqpath | default '')
+    children: (if (($kids | describe) =~ '^(list|table)') { $kids } else { [] })
+  }
+  }
+}
+
+# Build { fqpath -> { body_tokens:int, doc_tokens:int } }
+def _build-token-index [] {
+  rust-ast
+  | reduce -f {} {|r, acc|
+      let fq = ($r.fqpath | default '')
+      if $fq == '' {
+        $acc
+      } else {
+        $acc | upsert $fq {
+          body_tokens: ($r.body_tokens | default 0)
+          doc_tokens:  ($r.doc_tokens  | default 0)
+        }
+      }
+    }
+}
+
+def _spaces [n: int] {
+  if $n <= 0 { "" } else { (0..<$n | each { " " } | str join "") }
+}
+
+def _display-name [r: record] {
+  let fq = ($r.fqpath | default '')
+  if $fq == '' { ($r.name | default "") } else { $fq | split row '::' | last }
+}
+
+def _kind-width [rows: list<record>] {
+  $rows
+  | each {|r| (_vlen ($r.kind | default '')) }
+  | math max
+  | default 0
+}
+
+# Robustly pull a single root record out of whatever came in
+def _roots-of [x: any] {
+  let t = ($x | describe)
+
+  if ($t =~ '^record<') {
+    [ $x ]                           # single root -> list of 1
+  } else if ($t =~ '^(list|table)') {
+    $x                                # keep top-level items only
+    | where {|it| (($it | describe) =~ '^record<') }  # only records
+  } else if $t == 'string' {
+    let parsed = (try { $x | from json } catch { null })
+    if $parsed == null {
+      error make { msg: "print-symbol-tree: got a string that isn't JSON" }
+    } else {
+      _roots-of $parsed
+    }
+  } else {
+    error make { msg: $"print-symbol-tree: unsupported input type: ($t)" }
+  }
+}
+
+# ---------- tree walking (first pass: collect rows) ---------------------------
+
+def _collect-rows [
+  node: record,
+  ancestors_last: list<bool> = [],
+  is_last: bool = true
+] {
+  # Coerce `children` → always a list of records
+  let kids0 = (try { $node | get -i children } catch { [] })
+  let kids = (
+    [ (try { $node | get -i children } catch { [] }) ]
+    | flatten
+    | where {|x| (($x | describe) =~ '^record<') }
+  )
+  let n     = ($kids | length)
+
+  let prefix_parts = ($ancestors_last | each {|last| if $last { "   " } else { "|  " } })
+  let tee          = (if ($ancestors_last | length) == 0 { "" } else { if $is_last { "`- " } else { "|- " } })
+  let prefix = ($prefix_parts | str join "")
+  let line_prefix = ( $prefix + $tee )
+
+  let row = {
+    line_prefix: $line_prefix
+    depth: ($ancestors_last | length)
+    is_last: $is_last
+    is_leaf: ($n == 0)
+    name: (_display-name $node)
+    kind: ($node.kind | default '')
+    fqpath: ($node.fqpath | default '')
+  }
+
+  let children_rows = (
+    0..<( $n )
+    | each {|i|
+        let child = ($kids | get $i)
+        let lastf = ($i == ($n - 1))
+        _collect-rows $child ($ancestors_last | append $is_last) $lastf
+      }
+    | flatten
+  )
+
+  [$row] | append $children_rows
+}
+
+# ---------- second pass: compute widths & print -------------------------------
+
+def _print-with-columns [
+  rows: list<record>,
+  show_fq_on_branches: bool = false,
+  token_idx?: record
+] {
+  if ($rows | is-empty) { return }
+
+  let tok_enabled = ( ($token_idx | describe) =~ '^record<' )
+
+  # Pipe position uses PAINTED names so spacing matches the visible output
+  let target_pipe_col = (
+    $rows
+    | each {|r| (_vlen $r.line_prefix) + (_vlen (_paint-kind ($r.kind | default '') ($r.name | default ''))) }
+    | math max
+    | default 20
+  ) + 1
+
+  # Kind column width (painted)
+  let kind_w = (
+    $rows
+    | each {|r| (_vlen (_paint-kind ($r.kind | default '') ($r.kind | default ''))) }
+    | math max
+    | default 0
+  )
+
+  # fqpath width (only where shown)
+  let fq_w = (
+    $rows
+    | each {|r|
+        let show_fq = ($r.is_leaf or $show_fq_on_branches)
+        if $show_fq { (_vlen ($r.fqpath | default '')) } else { 0 }
+      }
+    | math max
+    | default 0
+  )
+
+  # -------- token sub-column widths (right-align numbers) --------
+  let body_w = if $tok_enabled {
+    $rows
+    | each {|r| (try { $token_idx | get $r.fqpath | get body_tokens } catch { null }) | default 0 | into string | str length }
+    | math max
+    | default 1
+  } else { 0 }
+
+  let doc_w = if $tok_enabled {
+    $rows
+    | each {|r| (try { $token_idx | get $r.fqpath | get doc_tokens } catch { null }) | default 0 | into string | str length }
+    | math max
+    | default 1
+  } else { 0 }
+
+  # total width of the tokens column once numbers are padded
+  let tok_w = if $tok_enabled {
+    (_vlen "Body Tokens: ") + $body_w + (_vlen ", Doc Tokens: ") + $doc_w
+  } else { 0 }
+
+  for r in $rows {
+    # Name (painted) + left padding to the first pipe
+    let name_raw = ($r.name | default '')
+    let name_col = (_paint-kind ($r.kind | default '') $name_raw)
+    let pre_len  = (_vlen $r.line_prefix)
+    let name_len = (_vlen $name_col)
+    let pad      = $target_pipe_col - ($pre_len + $name_len)
+    let pad      = if $pad < 1 { 1 } else { $pad }
+
+    # Kind (painted + padded)
+    let kind_raw = ($r.kind | default '')
+    let kind_txt = (_paint-kind $kind_raw $kind_raw)
+    let kind_pad = $kind_w - (_vlen $kind_txt)
+    let kind_pad = if $kind_pad < 0 { 0 } else { $kind_pad }
+    let kind_col = ($kind_txt + (_spaces $kind_pad))
+
+    # fqpath (no brackets)
+    let show_fq = ($r.is_leaf or $show_fq_on_branches)
+    let fq_txt  = if $show_fq { ($r.fqpath | default '') } else { '' }
+    let fq_pad  = $fq_w - (_vlen $fq_txt)
+    let fq_pad  = if $fq_pad < 0 { 0 } else { $fq_pad }
+    let fq_col  = ($fq_txt + (_spaces $fq_pad))
+
+    # tokens (optional column, with per-number alignment)
+    let tok_txt = if $tok_enabled {
+      let info  = (try { $token_idx | get $r.fqpath } catch { null })
+      if $info == null {
+        # produce a blank cell of the correct width so the column stays aligned
+        (_spaces $tok_w)
+      } else {
+        let btxt = (($info.body_tokens | default 0) | into string)
+        let dtxt = (($info.doc_tokens  | default 0) | into string)
+        let bpad = $body_w - (_vlen $btxt)
+        let dpad = $doc_w  - (_vlen $dtxt)
+        let bfmt = (_spaces (if $bpad < 0 { 0 } else { $bpad })) + $btxt
+        let dfmt = (_spaces (if $dpad < 0 { 0 } else { $dpad })) + $dtxt
+        $"Body Tokens: ($bfmt), Doc Tokens: ($dfmt)"
+      }
+    } else { "" }
+
+    # Assemble line
+    mut parts = [
+      $r.line_prefix,
+      $name_col,              # painted name
+      (_spaces $pad),
+      "| ",
+      $kind_col,
+      " | ",
+      $fq_col
+    ]
+    if $tok_enabled { $parts = ($parts | append " | " | append $tok_txt) }
+
+    print ($parts | str join "")
+  }
+}
+
+def _vlen [s: any] {
+  ($s | into string | ansi strip | str length)
+}
+
