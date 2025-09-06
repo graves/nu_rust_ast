@@ -1,69 +1,226 @@
 # =============================================================================
-# rust-ast — Rust symbol harvesting with ast-grep (CLI-only, --json=stream)
+# rust-ast toolkit — Harvest, analyze, and pretty-print Rust symbols & calls
 # =============================================================================
 #
-# WHAT THIS DOES
+# OVERVIEW
+# --------
+# CLI-oriented Nushell helpers that scan a Rust crate (or given paths) with
+# ast-grep and produce:
+#   1) A FLAT TABLE of symbols with rich, normalized metadata (`rust-ast`)
+#   2) A NESTED SYMBOL TREE for pretty printing (`rust-tree` -> `print-symbol-tree`)
+#   3) A CALL GRAPH (both callees-of and callers-of) with cycle/dup handling
+#      (`print-call-graph`, internal walkers)
+#   4) DEPENDENCY USAGE TREES per external crate, including grouped uses,
+#      alias resolution, and optional JSON-like nested records (`print-dep-usage`)
+#
+# The tooling is designed so you can compose commands in pipelines, or call the
+# printers directly. All printers accept piped input where noted.
+#
+# =============================================================================
+# 1) SYMBOL HARVESTING (FLAT TABLE)
+# =============================================================================
+#
+#   rust-ast [...paths]
+#
+# Scans Rust sources and emits a single, flat table of symbols:
+#   kind ∈ { fn | extern_fn | struct | enum | type | trait | impl
+#            | mod | macro_rules | const | static | use }
+#
+# For nodes with bodies (fns, struct-with-fields, traits, impls, inline mods),
+# `body_text` is captured verbatim. Tuple/unit structs, trait item decls, and
+# `mod foo;` have `body_text = null`. File modules (src/foo.rs, src/foo/mod.rs)
+# get a synthesized `mod` row covering the full file, with inner file docs.
+#
+# IMPORTANT INVARIANTS
+# --------------------
+# - Line spans (span.start_line / end_line) are 1-based and inclusive (ast-grep).
+# - Byte offsets are inclusive start / exclusive end (ast-grep).
+# - UFCS fqpaths are computed for impl methods:
+#     crate::<MyTy as my::Trait>::method   (trait impl)
+#     crate::MyTy::method                  (inherent impl)
+# - We attach leading rustdoc/#[doc] blocks to `doc`. For file modules we also
+#   capture top-of-file inner docs (//! or /*! ... */).
+#
+# OUTPUT SCHEMA (per row)
+# -----------------------
+# kind, name, crate, module_path[], fqpath, visibility,
+# file, span{start_line,end_line,start_byte,end_byte},
+# attrs[], signature, has_body, async|unsafe|const (bool flags),
+# abi|generics|where (optional strings),
+# doc?, impl_of?{trait_path?,type_path?}, trait_items[], reexports[],
+# body_text?, synthetic?, doc_tokens?, body_tokens?
+#
+# TOKEN COUNTING
 # --------------
-# Scans a Rust crate (or paths you pass) and emits a single, flat table of
-# symbols: fn/extern_fn/struct/enum/type/trait/impl/mod/macro_rules/const/static/use
-# Each row has normalized metadata (file, byte/line spans, visibility, fqpath,
-# module path, etc.). For nodes with bodies (fns, structs with fields, inline
-# mods, …) the exact source text is included in body_text when feasible.
+# Token counts are heuristic and configurable via $env.RUST_AST_TOKENIZER:
+#   - "words"   (default): rough word-based tokens
+#   - "chars"   : chars/4
+#   - "tiktoken": use tiktoken model (falls back to "words" if unavailable)
 #
-# IMPORTANT INVARIANTS / CONVENTIONS
-# ----------------------------------
-# - ast-grep line numbers (range.start.line / range.end.line) are 1-based and
-#   *inclusive*. We preserve those in span.start_line / span.end_line.
-# - Byte offsets are inclusive start / exclusive end, copied from ast-grep.
-# - For symbols matched with braces (`{ … }`) we set want_body=true and fill
-#   body_text via _extract-src. This includes fn, struct-with-fields, trait,
-#   impl, and inline mod definitions.
-# - Tuple/unit structs, trait item declarations, and `mod foo;` declarations
-#   have body_text=null.
-# - For file modules (e.g., src/foo.rs, src/foo/mod.rs), we *synthesize* a
-#   `mod` row that covers the entire file; body_text is the whole file.
-# - Each row also carries a `doc` string containing leading Rustdoc comments:
-#   contiguous `///`, `#[doc=…]`, or `/** … */` blocks immediately above the
-#   item are preserved verbatim. For file modules we additionally capture
-#   crate/module-level inner docs (`//!` or `/*! … */`).
-# - For fn inside impls we compute a richer fqpath using UFCS where needed:
-#   e.g., crate::<MyTy as my::Trait>::method, or crate::MyTy::method for
-#   inherent methods. Free functions keep their original fqpath.
-#
-# OUTPUT SCHEMA (each row)
+# EXTERNAL-CRATE DETECTION
 # ------------------------
-# kind:         string   # 'fn'|'extern_fn'|'struct'|'enum'|'type'|'trait'|'impl'|'mod'|'macro_rules'|'const'|'static'|'use'
-# name:         string   # best-effort symbol name ('*' for grouped-use leaf, file-mod name for synthetic mods)
-# crate:        string   # from Cargo.toml package.name; 'crate' fallback
-# module_path:  list     # e.g. ['foo','bar'] computed from file path under src/
-# fqpath:       string   # canonicalized path; e.g. 'crate::foo::bar::Baz' or UFCS for impl fns
-# visibility:   string   # 'pub'|'pub(crate)'|'pub(super)'|'pub(in …)'|'private'
-# file:         string   # absolute/expanded file path
-# span:         record   # { start_line:int, end_line:int, start_byte:int, end_byte:int }
-# attrs:        list     # reserved ([])
-# signature:    string   # normalized single-line signature/preamble (no body)
-# has_body:     bool     # syntax has a body ( { ... } ) or not
-# async|unsafe|const: bool   # best-effort flags parsed from signature text
-# abi|generics|where: string?  # captured meta (when present)
-# doc:          string?  # contiguous Rustdoc/#[doc] comments or inner-file docs (preserved verbatim)
-# impl_of:      record?  # for 'impl' and 'fn' inside impls: { trait_path?, type_path? }
-# trait_items:  list     # reserved
-# reexports:    list     # reserved
-# body_text:    string?  # exact matched text (want_body=true) or whole file for synthetic mods
-# synthetic:    bool?    # only for file-synthesized 'mod' rows
-# doc_tokens:   int?     # token estimate for `doc` (0 if empty)
-# body_tokens:  int?     # token estimate for `body_text` (0 if empty)
+# We parse the nearest Cargo.toml to identify *external* crates from:
+#   [dependencies], [dev-dependencies], [build-dependencies], and
+#   [target.*.dependencies], ignoring path/workspace deps.
 #
-# HOW PATTERN VARIABLES MAP IN AST-GREP
-# -------------------------------------
-# $N    name identifier
-# $G    generics/lifetime list node (no angle brackets in the capture itself)
-# $P    parameter list (fn)
-# $R    return type
-# $B    body chunks
-# $W    where-clause
-# $$$X  multi-capture (sequence) — tolerant of commas/docs/trailing commas
-# $X?   optional capture
+# =============================================================================
+# 2) NESTED SYMBOL TREE & PRINTER
+# =============================================================================
+#
+#   rust-tree [...paths] [--include-use]
+#
+# Produces a *minimal* nested tree of records for the crate rooted at "crate":
+#   { kind, name, fqpath, children: [...] }
+#
+#   rust-tree | print-symbol-tree [--fq-branches] [--tokens]
+#
+# Pretty-prints the nested tree with columns:
+#   - Name:    tree branches + symbol name (colorized by kind)
+#   - Kind:    aligned, colorized kind
+#   - FQ Path: shown for leaves; with --fq-branches also for branch nodes
+#   - Tokens:  optional rightmost column ("Body Tokens, Doc Tokens") when
+#              --tokens is supplied; widths are aligned per column.
+#
+# Notes:
+# - Color is via `ansi`; alignment uses visible-length (`ansi strip`) so spacing
+#   stays correct with or without color.
+# - FQ paths are printed as plain text (no brackets).
+#
+# Examples:
+#   rust-tree | print-symbol-tree
+#   rust-tree | print-symbol-tree --fq-branches
+#   rust-tree | print-symbol-tree --tokens
+#
+# =============================================================================
+# 3) CALL GRAPH (CALLEES / CALLERS)
+# =============================================================================
+#
+# Internals build a canonicalized adjacency (per-fqpath with generics/whitespace
+# stripped segment-wise) and a map from canonical → real fqpaths so display shows
+# real names even when multiple canonical variants exist.
+#
+#   print-call-graph <pattern>
+#     [--max-depth <N>=3] [--reverse] [--show-roots]
+#
+# - <pattern> can be an exact fqpath ("crate::api::ask"), a module tail
+#   ("::ask"), or a bare name ("ask"); multiple matches will render sequentially.
+# - Forward (default): "→ callees of" graph, rooted at seed(s)
+# - Reverse (--reverse): "← callers of" graph, rooted at seed(s)
+# - --show-roots prints a one-line header for each root
+# - Leaf column shows the *name* (last path segment) and the full fqpath in
+#   brackets, e.g.:
+#       ask  [crate::api::ask]
+#
+# CYCLES & DUPLICATES
+# -------------------
+# Walkers track a visited set and annotate loops (⟲ cycle). Repeated nodes are
+# printed once per path and not expanded again, preventing combinatorial blowups.
+#
+# =============================================================================
+# 4) DEPENDENCY USAGE (EXTERNAL CRATES)
+# =============================================================================
+#
+#   print-dep-usage [<crate>] [--max-depth <N>=4] [--include-maybe] [--records]
+#
+# Scans functions to find references to external crates, using:
+#   - explicit paths (e.g., `serde::Serialize::serialize`)
+#   - module-local aliases introduced by `use` (e.g., `use serde_json as sj;`)
+#   - optional glob imports (`use serde::*;`) gated via `--include-maybe`
+#
+# Output modes:
+#   (default) Pretty text per crate with callers-of trees for each seed function:
+#       Dependency usage: serde
+#       direct references
+#       serialize  [crate::my_mod::serialize] uses: Serialize
+#       ├─ ...
+#       └─ ...
+#
+#   --records  Emits *nested* records instead of text. For each crate:
+#       [
+#         {
+#           kind, name, fqpath, children: [...]
+#           (leaf nodes merged with { dep, ref_type: "real"|"maybe", uses: [...] })
+#         }
+#       ]
+#     If you pass a specific <crate>, the command returns just that crate's tree.
+#
+# Filtering & heuristics:
+#   - "direct references" are concrete symbol paths resolved to that crate
+#   - With --include-maybe, possible references via glob imports are included,
+#     but *only* when they lie on a callers-path that reaches a direct reference.
+#
+# DISPLAY DETAILS
+# ---------------
+# - For all call/dependency trees the first column prints the *leaf name*
+#   (short `name`), and the full fqpath is shown in brackets for clarity.
+# - Parents/continuation branches use ASCII/Unicode lines; repeated ancestors
+#   are marked with ⟲ and not expanded again.
+#
+# =============================================================================
+# 5) RUST `use` HANDLING
+# =============================================================================
+#
+#   rust-use-records
+#
+# Emits one row per `use` statement with normalized `signature` and `fqpath`.
+# Handles:
+#   - grouped imports:  use foo::{bar, baz::Qux as Alias, *};
+#   - aliasing:         use serde_json as sj;
+#   - base resolution:  `crate` is normalized against the module path
+#   - grouped leaves:   a synthetic '*' name is used where appropriate
+#
+# Auxiliary expanders:
+#   - `_expand-grouped-use`, `_expand-group-item` split grouped uses into leaves
+#   - `_alias-map-by-module` maps visible alias/bindings → external crate names
+#   - `_ext_globs_by_module` records external crates imported via `::*` per module
+#
+# =============================================================================
+# 6) COMPOSITION & PIPING
+# =============================================================================
+#
+# - Most printers accept piped rows from `rust-ast` to avoid re-scanning:
+#     rust-ast | print-dep-usage serde
+#     rust-ast | print-dep-usage --records | to json
+#
+# - `print-symbol-tree` expects the *nested* shape from `rust-tree`:
+#     rust-tree | print-symbol-tree --tokens
+#
+# =============================================================================
+# 7) QUICK RECIPES
+# =============================================================================
+#
+# - Show a colorized, aligned tree of your crate (no uses):
+#     rust-tree | print-symbol-tree
+#
+# - Same, with fqpath on every node and token counts aligned to the right:
+#     rust-tree | print-symbol-tree --fq-branches --tokens
+#
+# - Who calls `crate::api::prepare_messages` (up to 5 levels)?
+#     print-call-graph crate::api::prepare_messages --reverse --max-depth 5 --show-roots
+#
+# - Where do we reference `serde`? (pretty)
+#     print-dep-usage serde --max-depth 5 --include-maybe
+#
+# - Where do we reference `serde`? (structured)
+#     rust-ast | print-dep-usage serde --records | to json
+#
+# =============================================================================
+# IMPLEMENTATION NOTES (highlights)
+# =============================================================================
+#
+# - Canonicalization: `_fq_canon` strips generics/whitespace per segment so
+#   adjacencies remain stable across monomorphizations; display uses `canon2real`
+#   to recover a representative real path.
+#
+# - Name vs FQ display: Tree/graph printers show the short `name` (leaf) in the
+#   first column and the full `fqpath` in brackets. This improves scanability.
+#
+# - Cycle/dup guarding: Callers/callees renderers track a `seen` set; previously
+#   visited nodes are shown once with a ⟲ marker and not expanded again.
+#
+# - Performance: Most builders accept piped input to avoid re-running `rust-ast`.
+#   `print-dep-usage --records` shares the row index with the tree builder to
+#   prevent re-computation.
 #
 # =============================================================================
 export def rust-ast [...paths:string] {
@@ -187,8 +344,84 @@ def _target-list [...paths:string] {
 # Read Cargo.toml package.name (best effort). Falls back to "crate".
 def _cargo-crate-name [] {
   try {
-    open Cargo.toml | from toml | get package.name
+    # open --raw Cargo.toml | from toml | get package.name
+    open Cargo.toml | get package.name     # if you prefer implicit parse
   } catch { "crate" }
+}
+
+# Find the nearest Cargo.toml by walking up from pwd
+def _find-cargo-root [] {
+  mut cur = (pwd)
+  loop {
+    let cand = ([$cur "Cargo.toml"] | path join)
+    let typ  = (try { $cand | path type } catch { null })
+
+    if $typ == 'file' {
+      return { root: $cur, cargo: $cand }
+    }
+
+    let parent = ($cur | path dirname)
+    if $parent == $cur { break }   # reached fs root
+    $cur = $parent
+  }
+  null
+}
+
+# Read Cargo.toml (nearest), return {} if none
+def _read-cargo-toml [] {
+  let loc = (_find-cargo-root)
+  if $loc == null { {} } else {
+    try {
+      # EITHER explicit:
+      open --raw $loc.cargo | from toml
+      # OR implicit (no from toml):
+      # open $loc.cargo
+    } catch {|e|
+      {}
+    }
+  }
+}
+
+# --- replace your _external-crate-set with this ---
+def _external-crate-set [] {
+  let toml = (_read-cargo-toml)
+
+  def _g [rec key] { $rec | get -i $key | default {} }
+  def _keys [x] { if (($x | describe) =~ '^record<') { $x | columns } else { [] } }
+
+  def _is-ext [v] {
+    let t = ($v | describe)
+    if $t == 'string' {
+      true
+    } else if ($t | str starts-with 'record<') {
+      let has_path = (try { $v | get -i path } catch { null }) != null
+      let has_ws   = (try { $v | get -i workspace } catch { null }) != null
+      (not $has_path) and (not $has_ws)
+    } else { false }
+  }
+
+  def _dep-keys [t] {
+    let sections = [
+      (_g $t dependencies)
+      (_g $t 'dev-dependencies')
+      (_g $t 'build-dependencies')
+      ( (_g $t target | values | each {|sec| _g $sec "dependencies"} ) | flatten | default {} )
+    ]
+    $sections
+    | each {|rec|
+        _keys $rec
+        | where {|k| _is-ext (try { $rec | get $k } catch { null }) }
+      }
+    | flatten
+  }
+
+  _dep-keys $toml | uniq | sort
+}
+
+# O(1) membership
+def _external-crate-map [] {
+  _external-crate-set
+  | reduce -f {} {|name, acc| $acc | upsert $name true }
 }
 
 # Convert file path to "module path" (Vec<String>) rooted at src/.
@@ -1474,7 +1707,7 @@ def _paint-kind [kind:string, text:string] {
     "fn"         => $"(ansi green)($t)(ansi reset)"
     "extern_fn"  => $"(ansi light_green)($t)(ansi reset)"
     "struct"     => $"(ansi magenta)($t)(ansi reset)"
-    "enum"       => $"(ansi putple)($t)(ansi reset)"
+    "enum"       => $"(ansi purple)($t)(ansi reset)"
     "trait"      => $"(ansi cyan)($t)(ansi reset)"  # or 'purple' (alias)
     "impl"       => $"(ansi yellow)($t)(ansi reset)"
     "const"      => $"(ansi light_red)($t)(ansi reset)"
@@ -1782,3 +2015,811 @@ def _vlen [s: any] {
   ($s | into string | ansi strip | str length)
 }
 
+# =============================================================================
+# call graph (edges + printer)
+# =============================================================================
+
+# Build unique edges with *both* real and canonical fqpaths
+def _build-call-edges [rows:list<record>] {
+  let fns = ($rows | where {|r| ($r | get -i kind | default '') == 'fn' })
+
+  let files = (
+    $rows
+    | each {|r| ($r | get -i file | default null) }
+    | where {|f| $f != null }
+    | uniq
+  )
+
+  let calls    = (_rust-call-sites-on $files)
+  let fn_index = (_index-fns-by-file $fns)
+  let idx      = (_build-fn-indexes $fns)
+
+  $calls
+  | each {|c|
+      let caller = (_enclosing-fn $fn_index $c.file ($c.span.start_byte | default 0) ($c.span.end_byte | default 0))
+      if $caller == null { null } else {
+        let target = (_resolve-call $idx $fns $c $caller)
+        if $target == null { null } else {
+          let caller_fq = ($caller.fqpath | default '')
+          let callee_fq = ($target.fqpath | default '')
+          if $caller_fq == '' or $callee_fq == '' { null } else {
+            {
+              caller: $caller_fq,
+              callee: $callee_fq,
+              caller_c: (_fq_canon $caller_fq),
+              callee_c: (_fq_canon $callee_fq),
+            }
+          }
+        }
+      }
+    }
+  | where {|e| $e != null }
+  | uniq
+}
+
+# Map a free-form pattern → seed fqpaths to start the graph from
+# - Accepts: exact fqpath ("crate::api::ask"), ends-with module path ("::ask"),
+#   or bare name ("ask"). If multiple matches, returns them all.
+def _lookup-fn-seeds [fns:list<record>, pattern:string] {
+  let pat = ($pattern | into string | str trim)
+  if ($pat | str starts-with 'crate::') {
+    $fns | where {|r| ($r.fqpath | default '') == $pat } | get -i fqpath
+  } else if ($pat | str contains '::') {
+    $fns | where {|r| ($r.fqpath | default '') | str ends-with $pat } | get -i fqpath
+  } else {
+    let by_name = ($fns | where name == $pat | get -i fqpath)
+    if (not ($by_name | is-empty)) { $by_name } else {
+      $fns | where {|r| ($r.fqpath | default '') | str ends-with $"::($pat)" } | get -i fqpath
+    }
+  }
+}
+
+def _walk-fq-tree [
+  adj: record,                 # canonical -> [canonical]
+  canon2real: record,          # canonical -> [real fq]
+  node_c: string,              # canonical seed
+  max_depth: int,
+  ancestors_last: list<bool> = [],
+  visited: list<string> = [],  # canonical
+] {
+  let is_cycle = ($visited | any {|v| $v == $node_c })
+  let indent   = ($ancestors_last | each {|last| if $last { "   " } else { "|  " } } | str join "")
+  let tee      = (if ($ancestors_last | length) == 0 { "" } else { "|- " })
+  let face_fq  = (try { $canon2real | get $node_c | get 0 } catch { $node_c })
+  let face_nm  = (_leaf-name $face_fq)
+
+  mut out = [ $"($indent)($tee)(ansi white)($face_nm)(ansi reset)  (ansi dark_gray)[($face_fq)](ansi reset)" ]
+
+  if $is_cycle or $max_depth <= 0 { 
+    if $is_cycle { let out = ($out | append $"($indent)   (ansi red)⟲ cycle(ansi reset)") }
+    return $out
+  }
+
+  let kids = (try { $adj | get $node_c } catch { [] }) | default [] | uniq | sort
+  let n = ($kids | length)
+  for i in 0..<( $n ) {
+    let ch = ($kids | get $i)
+    let sub = _walk-fq-tree $adj $canon2real $ch ($max_depth - 1) ($ancestors_last | append ($i == ($n - 1))) ($visited | append $node_c)
+    $out = ($out | append $sub)
+  }
+  $out
+}
+
+# Build canonical adjacency and a mapping from canonical -> set of real fqpaths
+def _adjacency-from-edges [
+  edges:list<record<caller:string, callee:string, caller_c:string, callee_c:string>>,
+  reverse: bool = false
+] {
+  let adj = (
+    $edges
+    | reduce -f {} {|e, acc|
+        let from_c = (if $reverse { $e.callee_c } else { $e.caller_c })
+        let to_c   = (if $reverse { $e.caller_c } else { $e.callee_c })
+        let cur    = (try { $acc | get $from_c } catch { [] })
+        let nxt    = ($cur | append $to_c | uniq | sort)
+        $acc | upsert $from_c $nxt
+      }
+  )
+  let canon2real = (
+    $edges
+    | reduce -f {} {|e, acc|
+        let a1 = ($acc | upsert $e.caller_c ((try { $acc | get $e.caller_c } catch { [] }) | append $e.caller | uniq | sort))
+        let a2 = ($a1   | upsert $e.callee_c ((try { $a1  | get $e.callee_c } catch { [] }) | append $e.callee | uniq | sort))
+        $a2
+      }
+  )
+  { adj: $adj, canon2real: $canon2real }
+}
+
+def _leaf [fq:string] { $fq | split row '::' | last }
+
+# Walk a *canonical* adjacency but print the *real* fqpaths.
+def _walk-call-graph [
+  adj: record,               # canonical -> [canonical]
+  canon2real: record,        # canonical -> [real fqpaths]
+  node_c: string,            # canonical fqpath of current node
+  max_depth: int,
+  ancestors_last: list<bool> = [],
+  visited: list<string> = [] # canonical seen
+] {
+  let is_cycle = ($visited | any {|v| $v == $node_c })
+  let prefix   = ($ancestors_last | each {|last| if $last { "   " } else { "|  " } } | str join "")
+  let tee      = (if ($ancestors_last | length) == 0 { "" } else { "|- " })
+  let real0    = (try { $canon2real | get $node_c | get 0 } catch { $node_c })
+  let face_nm  = (_leaf-name $real0)
+
+  mut out = [ $"($prefix)($tee)(ansi white)($face_nm)(ansi reset)  (ansi dark_gray)[($real0)](ansi reset)" ]
+
+  if $is_cycle or $max_depth <= 0 {
+    if $is_cycle { let out = ($out | append $"($prefix)   (ansi red)⟲ cycle detected(ansi reset)") }
+    return $out
+  }
+
+  let children_c = (try { $adj | get $node_c } catch { [] }) | default [] | uniq | sort
+  let n = ($children_c | length)
+  for i in 0..<( $n ) {
+    let ch_c = ($children_c | get $i)
+    let sub = _walk-call-graph $adj $canon2real $ch_c ($max_depth - 1) ($ancestors_last | append ($i == ($n - 1))) ($visited | append $node_c)
+    $out = ($out | append $sub)
+  }
+  $out
+}
+
+export def print-call-graph [
+  pattern:string,
+  --max-depth:int = 3,
+  --reverse,       # callers-of when set; else callees-of
+  --show-roots,
+] {
+  let rows = (rust-ast)              # already includes callers via _attach_callers
+  let fns  = ($rows | where kind == 'fn')
+
+  let seeds_real = (_lookup-fn-seeds $fns $pattern)
+  if ($seeds_real | is-empty) {
+    error make { msg: $"print-call-graph: no function matched: '($pattern)'" }
+  }
+  let seeds_c = ($seeds_real | each {|fq| _fq_canon $fq } | uniq)
+
+  let built = (_adj_from_rows $rows)
+  let adj   = (if ($reverse | default false) { $built.callers_of } else { $built.callees_of })
+  let map   = $built.canon2real
+
+  for root_c in $seeds_c {
+    # Prefer a real fq from canon→real; fall back to the matching seed
+    let root_real = (try { $map | get $root_c | get 0 } catch { ($seeds_real | where {|fq| (_fq_canon $fq) == $root_c } | get 0) })
+    if ($show_roots | default false) {
+      let dir = (if ($reverse | default false) { "← callers of" } else { "→ callees of" })
+      print $"(ansi cyan)Call graph depth: ($max_depth) (ansi reset)(ansi dark_gray)($dir)(ansi reset) (ansi white)($root_real)(ansi reset)"
+    }
+    let lines = _walk-fq-tree $adj $map $root_c $max_depth [] []
+    for ln in $lines { print $ln }
+    if ($seeds_c | length) > 1 { print "" }
+  }
+}
+
+# Split an fqpath into (module_chain, leaf_name)
+# "crate::a::b::c" -> (["crate","crate::a","crate::a::b"], "c")
+def _fq_split [fq:string] {
+  let parts = ($fq | split row '::')
+  if ($parts | is-empty) { return [[], $fq] }
+  let leaf  = ($parts | last)
+  let mods  = (
+    0..<( ($parts | length) - 1 )
+    | each {|i| ($parts | take ($i + 1) | str join '::') }
+  )
+  [ $mods, $leaf ]
+}
+
+# Paint a module name (folder-like) and a function name (leaf-like)
+def _paint-node-line [fq:string, kind:string] {
+  let name = ($fq | split row '::' | last)
+  match $kind {
+    "mod" => $"(ansi blue)($name)(ansi reset)  (ansi dark_gray)[($fq)](ansi reset)"
+    "fn"  => $"(ansi white)($name)(ansi reset)  (ansi dark_gray)[($fq)](ansi reset)"
+    _     => $"(ansi white)($name)(ansi reset)  (ansi dark_gray)[($fq)](ansi reset)"
+  }
+}
+
+# Decide if an fqpath is a known function
+def _is_fn_fq [fn_index:list<record<fqpath: string>> , fq:string] {
+  ($fn_index | where fqpath == $fq | length) > 0
+}
+
+# Map: module_path -> { alias_or_leaf -> external_crate_name }
+def _alias-map-by-module [rows:list<record>] {
+  let exts = (_external-crate-map)
+  $rows
+  | where kind == 'use'
+  | where {|u| not (($u.fqpath | default '') | str ends-with '::*') }  # skip globs here
+  | each {|u|
+      let mp    = ($u.module_path | default [] | str join '::')
+      let path  = ($u.fqpath | default '')
+      if ($path == '' or $path == 'crate') { null } else {
+        let segs = ($path | split row '::')
+        let first = (if ($segs | is-empty) { '' } else { $segs | get 0 })
+        # Only care if the 'first' segment is an external crate
+        let is_ext = (try { $exts | get $first } catch { null }) == true
+        if (not $is_ext) { null } else {
+          # Determine binding name visible in this module:
+          # - if signature had "as Alias", rust-use-records put that in `name`
+          # - else leaf of the path
+          let bind = (try { $u.name } catch { null }) | default ( $segs | last )
+          { mod: $mp, bind: $bind, crate: $first }
+        }
+      }
+    }
+  | where {|x| $x != null }
+  | group-by mod
+  | transpose mod items
+  | reduce -f {} {|it, acc|
+      let pairs = ($it.items | each {|r| { ($r.bind): $r.crate } } )
+      let merged = ($pairs | reduce -f {} {|p, a| $a | merge $p })
+      $acc | upsert $it.mod $merged
+    }
+}
+
+# Canonicalize an fqpath by removing generic/lifetime args in each segment.
+# Accepts null/empty and returns "" in that case.
+def _fq_canon [fq?: string] {
+  let s = ($fq | default "" | into string)
+  if $s == "" { "" } else {
+    ($s
+     | split row '::'
+     | each {|seg|
+         $seg
+         | str replace --regex --all '<[^>]*>' ''   # strip <...>
+         | str replace --regex --all '\s+' ''       # strip spaces
+       }
+     | str join '::')
+  }
+}
+
+# Return table: { fqpath, uses: list<string>, maybe: list<string> }
+def _scan-ext-refs-on-fns [rows:list<record>] {
+  let ex_crates = (_external-crate-set)
+  let ex_set    = ($ex_crates | reduce -f {} {|c, acc| $acc | upsert $c true })
+  let globs     = (_ext_globs_by_module $rows)
+  let aliases   = (_alias-map-by-module $rows)
+
+  let fns = ($rows | where kind == 'fn')
+
+  # split into “pathish” tokens that contain '::'
+  def _path_tokens [s:string] {
+    $s
+    | split row -r '[^A-Za-z0-9_:]+'
+    | where {|t| $t | str contains '::'}
+  }
+
+  $fns
+  | each {|f|
+      let mp     = ($f.module_path | default [] | str join '::')
+      let glb    = (try { $globs | get $mp } catch { [] }) | default []
+      let a_map  = (try { $aliases | get $mp } catch { {} })
+
+      let sig  = ($f.signature | default '')
+      let body = ($f.body_text | default '')
+      let txt  = $"($sig)\n($body)"
+
+      # 1) gather full path tokens
+      let paths = (_path_tokens $txt)
+
+      # 2) map token → (dep, sym) by resolving first segment via external set or alias map
+      let details = (
+        $paths
+        | each {|p|
+            let segs = ($p | split row '::')
+            if ($segs | is-empty) { null } else {
+              let first = ($segs | get 0)
+              let dep0  = (if ((try { $ex_set | get $first } catch { false }) == true) {
+                            $first
+                          } else {
+                            (try { $a_map | get $first } catch { null })
+                          })
+              if ($dep0 == null) { null } else {
+                let sym = ($segs | skip 1 | str join '::')  # what’s used *within* the dep
+                { dep: ($dep0 | str downcase), sym: $sym }
+              }
+            }
+          }
+        | where {|x| $x != null }
+      )
+
+      # 3) coarse “uses” set (deps only) for compatibility
+      let direct_deps = ($details | get dep | uniq | sort | default [])
+
+      # 4) maybe (glob) heuristic
+      let maybe_from_glob = if ($glb | is-empty) {
+        []
+      } else {
+        if ($txt | str contains '(') { $glb } else { [] }
+      }
+
+      {
+        fqpath: $f.fqpath,
+        uses:   $direct_deps,
+        maybe:  ($maybe_from_glob | uniq | sort),
+        uses_detail: (
+          $details
+          | group-by dep
+          | transpose dep items
+          | each {|g| { dep: $g.dep, syms: ($g.items | get sym | where {|s| ($s | default '' | str length) > 0 } | uniq | sort) } }
+        )
+      }
+    }
+}
+
+# Build canonical adjacency and canon→real map using rows that already have `callers: [...]`
+def _adj_from_rows [
+  rows: list<record>,   # output of rust-ast (already has callers on fn rows)
+] {
+  let fns = ($rows | where kind == 'fn')
+
+  # canon→real display names (prefer de-duped, sorted)
+  let canon2real = (
+    $fns
+    | reduce -f {} {|r, acc|
+        let fq  = ($r.fqpath | default '')
+        if $fq == '' { $acc } else {
+          let c = (_fq_canon $fq)
+          let cur = (try { $acc | get $c } catch { [] })
+          $acc | upsert $c ($cur | append $fq | uniq | sort)
+        }
+      }
+  )
+
+  # Two directed adjacencies from the same data:
+  #  - callers_of:   callee_canon -> [caller_canon]
+  #  - callees_of:   caller_canon -> [callee_canon]
+  let callers_of = (
+    $fns
+    | reduce -f {} {|r, acc|
+        let callee_fq = ($r.fqpath | default '')
+        if $callee_fq == '' { $acc } else {
+          let callee_c = (_fq_canon $callee_fq)
+          let callers  = ($r.callers | default [] | where {|x| ($x | default '') != '' })
+          let caller_cs = ($callers | each {|cfq| _fq_canon $cfq })
+          let cur = (try { $acc | get $callee_c } catch { [] })
+          $acc | upsert $callee_c ($cur | append $caller_cs | flatten | uniq | sort)
+        }
+      }
+  )
+
+  let callees_of = (
+    $fns
+    | reduce -f {} {|r, acc|
+        let callee_fq = ($r.fqpath | default '')
+        let callers   = ($r.callers | default [])
+        if ($callee_fq == '' or ($callers | is-empty)) { $acc } else {
+          let callee_c = (_fq_canon $callee_fq)
+          $callers
+          | each {|caller_fq|
+              let caller_c = (_fq_canon $caller_fq)
+              let cur = (try { $acc | get $caller_c } catch { [] })
+              $acc | upsert $caller_c ($cur | append $callee_c | uniq | sort)
+            }
+          | reduce -f $acc {|_, a| $a }  # passthrough
+        }
+      }
+  )
+
+  { callers_of: $callers_of, callees_of: $callees_of, canon2real: $canon2real }
+}
+
+# Map: module_path (joined by ::) -> set<external_crate_with_glob_import>
+def _ext_globs_by_module [rows:list<record>] {
+  let exts = (_external-crate-map)
+  $rows
+  | where kind == 'use'
+  | where {|u| ($u.fqpath | default '') | str ends-with '::*' }
+  | each {|u|
+      let mp  = ($u.module_path | default [] | str join '::')
+      let fst = ($u.fqpath | split row '::' | get 0)
+      let is_ext = (try { $exts | get $fst } catch { null }) == true
+      if $is_ext { { mod: $mp, ext: $fst } } else { null }
+    }
+  | where {|x| $x != null }
+  | group-by mod
+  | transpose mod items
+  | reduce -f {} {|it, acc| $acc | upsert $it.mod ($it.items | get ext | uniq | sort) }
+}
+
+# Walk callers-of adjacency to roots, printing a tree (internal-only nodes).
+def _walk-callers-tree [
+  callers_of: record,           # canon -> [canon callers]
+  canon2real: record,           # canon -> [real fqs]
+  node_c: string,
+  max_depth:int,
+  ancestors_last:list<bool> = [],
+  visited:list<string> = []
+] {
+  let cyc = ($visited | any {|v| $v == $node_c })
+  let prefix = ($ancestors_last | each {|last| if $last { "   " } else { "|  " } } | str join "")
+  let tee    = (if ($ancestors_last | length) == 0 { "" } else { "|- " })
+  let real0  = (try { $canon2real | get $node_c | get 0 } catch { $node_c })
+  mut out = [ $"($prefix)($tee)(ansi white)($real0 | split row '::' | last)(ansi reset)  (ansi dark_gray)[($real0)](ansi reset)" ]
+
+  if $cyc or $max_depth <= 0 {
+    if $cyc { let out = ($out | append $"($prefix)   (ansi red)⟲ cycle(ansi reset)") }
+    return $out
+  }
+
+  let parents = (try { $callers_of | get $node_c } catch { [] }) | default [] | uniq | sort
+  let n = ($parents | length)
+  for i in 0..<( $n ) {
+    let p = ($parents | get $i)
+    let sub = _walk-callers-tree $callers_of $canon2real $p ($max_depth - 1) ($ancestors_last | append ($i == ($n - 1))) ($visited | append $node_c)
+    let out = ($out | append $sub)
+  }
+  $out
+}
+
+# Renders a callers tree (up to max depth) for a canon name.
+# callers: map<canon -> list<canon>>
+# canon2real: map<canon -> list<fqpath>>
+def _render_callers_tree [root maxd callers canon2real root_label?: string] {
+
+  let C_hdr = (ansi cyan)
+  let C_fn  = (ansi white)
+  let C_fq  = (ansi dark_gray)
+  let C_br  = (ansi dark_gray)
+  let R     = (ansi reset)
+
+  def _fq_of [canon canon2real] {
+    let v = ($canon2real | get -i $canon | default [])
+    if ($v | length) > 0 { $v | get 0 } else { $canon }
+  }
+
+  # --- add: seen set to avoid repeats (see §2) ---
+  def _go [node prefix depth_left callers canon2real seen:list<string>] {
+    if $depth_left <= 0 { return [] }
+
+    let parents = ($callers | get -i $node | default [] | enumerate)
+    if ($parents | is-empty) { return [] }
+
+    let last_idx = (($parents | length) - 1)
+    mut out = []
+    for it in $parents {
+      let p = $it.item
+      let i = $it.index
+      let is_last = ($i == $last_idx)
+      let branch  = (if $is_last { "└─ " } else { "├─ " })
+      let cont    = (if $is_last { "   " } else { "│  " })
+
+      let fq    = (_fq_of $p $canon2real)
+      let short = (_leaf $fq)
+
+      # if we've already shown this node, mark and don’t expand it again
+      if ($seen | any {|x| $x == $p }) {
+        let line = $"($C_br)($prefix)($branch)($R)($C_fn)($short)($R)  ($C_fq)[($fq)] (ansi red)⟲(ansi reset)"
+        $out = ($out | append $line)
+        continue
+      }
+
+      let line = $"($C_br)($prefix)($branch)($R)($C_fn)($short)($R)  ($C_fq)[($fq)]($R)"
+      $out = ($out | append $line)
+      $out = ($out | append (_go $p $"($prefix)($cont)" ($depth_left - 1) $callers $canon2real ($seen | append $p)))
+    }
+    $out
+  }
+
+  let header = $"($C_hdr)Call graph depth: ($maxd) ← callers of (_fq_of $root $canon2real)($R)"
+
+  let first  = if ($root_label | default '' | str length) > 0 {
+    $root_label
+  } else {
+    let fq0   = (_fq_of $root $canon2real)
+    let short = (_leaf $fq0)
+    $"($C_fn)($short)($R)  ($C_fq)[($fq0)]($R)"
+  }
+
+  [ $header, $first ] | append (_go $root "" $maxd $callers $canon2real [])
+}
+
+def _leaf-name [fq:string] {
+  $fq | split row '::' | last
+}
+
+# --- helper: build a nested tree from a set of fqpaths (and optionally leaf annotations)
+# Accept an optional prebuilt rows index to avoid recomputing rust-ast during tree build.
+# Build a nested tree from a set of fqpaths (and optionally leaf annotations).
+# fq_list can be any type; we'll sanitize it to a list<string>.
+def _tree_from_fqpaths [
+  fq_list:any,                      # tolerant input
+  leaf_info?: record,               # optional: { <fq> -> {...} }
+  rows_idx?: record                 # optional: { <fq> -> minimal row }
+] {
+  # 0) sanitize inputs to a clean, unique, sorted list<string>
+  let fqs = (
+    [ $fq_list ] | flatten
+    | where {|x| ($x | describe) == 'string' }
+    | where {|x| ($x | str length) > 0 }
+    | uniq | sort
+  )
+
+  if ($fqs | is-empty) {
+    return [ { kind: "mod", name: "crate", fqpath: "crate", children: [] } ]
+  }
+
+  # 1) collect all intermediate nodes from crate to each leaf
+  def _chains_of [fq:string] {
+    let parts = ($fq | split row '::')
+    0..<( $parts | length )
+    | each {|i| ($parts | take ($i + 1) | str join '::') }
+  }
+
+  let all_nodes = (
+    $fqs
+    | reduce -f (["crate"]) {|fq, acc| $acc | append (_chains_of $fq) }
+    | flatten | uniq | sort
+  )
+
+  # 2) parent → children table (query via a list to avoid 'nothing' inputs)
+  let edges = (
+    $all_nodes
+    | each {|fq|
+        if $fq == "crate" { null } else {
+          let parent = ($fq | split row '::' | drop 1 | str join '::' | default "crate")
+          { parent: (if $parent == "" { "crate" } else { $parent }), child: $fq }
+        }
+      }
+    | where {|x| $x != null }
+    | group-by parent
+    | transpose parent rows
+    | each {|g| { parent: $g.parent, children: ($g.rows | get child | uniq | sort) } }
+  )
+
+  # 3) minimal row lookup (prefer provided index, else fall back)
+  let idx = (
+    if (($rows_idx | describe) =~ '^record<') { $rows_idx } else { _rows-index (rust-ast) }
+  )
+
+  def _mk_node [fq:string] {
+    let base = (try { $idx | get $fq } catch { null })
+    if $base != null { $base } else {
+      { kind: "mod", name: ($fq | split row '::' | last), fqpath: $fq, children: [] }
+    }
+  }
+
+  def _nest [fq:string] {
+    let base = (_mk_node $fq)
+    let kids_fq = (
+      [ $edges ] | flatten
+      | where parent == $fq
+      | get 0?
+      | get -i children
+      | default []
+    )
+    let kids = (
+      $kids_fq
+      | each {|c| _nest $c }
+      | where {|x| (($x | describe) =~ '^record<') }
+    )
+
+    let node0 = ($base | upsert children $kids)
+
+    if (($leaf_info | describe) =~ '^record<') and ($kids | is-empty) {
+      let ann = (try { $leaf_info | get $fq } catch { null })
+      if $ann == null { $node0 } else { $node0 | merge $ann }
+    } else {
+      $node0
+    }
+  }
+
+  [ (_nest "crate") ]
+}
+
+# --- modify: print-dep-usage to support --records output and piped rows (no nested rust-ast calls)
+export def print-dep-usage [
+  dep?: string
+  --max-depth:int = 4
+  --include-maybe
+  --records                 # emit nested records instead of pretty text
+] {
+  # Prefer piped rows if present
+  let piped = $in
+  let rows = (
+    if (( $piped | describe ) =~ '^(list|table)') and (not ($piped | is-empty)) and (($piped | first | describe) =~ '^record<') {
+      $piped
+    } else {
+      rust-ast
+    }
+  )
+
+  let ext_set = (_external-crate-set)
+  if ($ext_set | is-empty) {
+    error make { msg: "print-dep-usage: no external deps found in Cargo.toml" }
+  }
+
+  let scanned    = (_scan-ext-refs-on-fns $rows)
+  let built      = (_adj_from_rows $rows)
+  let callers    = $built.callers_of
+  let canon2real = $built.canon2real
+  let rows_idx   = (_rows-index $rows)   # build once, pass into tree builder
+
+  # Build per-dep index like before (real/maybe)
+  mut dep_index = {}
+  for row in $scanned {
+    let fq       = ($row.fqpath | default '')
+    let uses_det = ($row.uses_detail | default [])
+    let maybes   = ($row.maybe | default [])
+
+    for d in $uses_det {
+      let key = ($d.dep | str downcase)
+      if ($ext_set | any {|e| ($e | str downcase) == $key }) {
+        let cur = ($dep_index | get -i $key | default { real: {}, maybe: {} })
+        let cur_syms = ($cur.real | get -i $fq | default [])
+        let next_syms = ($cur_syms | append $d.syms | flatten | uniq | sort)
+        let nxt = ($cur | upsert real ($cur.real | upsert $fq $next_syms))
+        $dep_index = ($dep_index | upsert $key $nxt)
+      }
+    }
+
+    if $include_maybe {
+      for m in $maybes {
+        let key = ($m | str downcase)
+        if ($ext_set | any {|e| ($e | str downcase) == $key }) {
+          let cur = ($dep_index | get -i $key | default { real: {}, maybe: {} })
+          let cur_syms = ($cur.maybe | get -i $fq | default [])
+          let nxt = ($cur | upsert maybe ($cur.maybe | upsert $fq $cur_syms))
+          $dep_index = ($dep_index | upsert $key $nxt)
+        }
+      }
+    }
+  }
+
+  let wanted = if ($dep | default '' | str length) > 0 {
+    let key = ($dep | str downcase)
+    if ($dep_index | columns | any {|k| $k == $key }) { [ $key ] } else { [] }
+  } else {
+    ($dep_index | columns | sort)
+  }
+
+  # If --records is set: build nested trees (one per dep if dep not specified; else just the tree)
+  if $records {
+    mut out = []
+    for crate_name in $wanted {
+      let info = ($dep_index | get $crate_name | default { real: {}, maybe: {} })
+      let seeds_real_map   = ($info.real  | default {})
+      let seeds_maybe_map  = ($info.maybe | default {})
+
+      # limit maybe-seeds to callers-path of real seeds
+      def _collect_ancestors [start_canon: string, maxd: int] {
+        mut seen = [$start_canon]
+        mut frontier = [$start_canon]
+        mut depth = 0
+        while ( $depth < $maxd ) {     # tightened from <= to <
+          mut nxt = []
+          for n in $frontier {
+            let parents = ($callers | get -i $n | default [])
+            for p in $parents {
+              if not ($seen | any {|x| $x == $p }) {
+                $seen = ($seen | append $p)
+                $nxt  = ($nxt  | append $p)
+              }
+            }
+          }
+          if ($nxt | is-empty) { break }
+          $frontier = $nxt
+          $depth = ($depth + 1)
+        }
+        $seen
+      }
+
+      let seeds_real  = ($seeds_real_map  | columns | sort)
+      let seeds_maybe_all = ($seeds_maybe_map | columns | sort)
+
+      mut on_path = {}
+      for s in $seeds_real {
+        let c = (_fq_canon $s)
+        let anc = (_collect_ancestors $c $max_depth)
+        for a in $anc { $on_path = ($on_path | upsert $a true) }
+      }
+      let seeds_maybe = (
+        $seeds_maybe_all
+        | where {|fq| ($on_path | get -i (_fq_canon $fq) | default false) }
+      )
+
+      let keep_fqs = ($seeds_real | append $seeds_maybe)
+
+      if (not ($keep_fqs | is-empty)) {
+        # annotate leaves: { fq -> {dep, ref_type, uses} }
+        let leaf_info = (
+          $keep_fqs
+          | reduce -f {} {|fq, acc|
+              let uses = ($seeds_real_map | get -i $fq | default [])
+              let ref_type = (if (not ($uses | is-empty)) { "real" } else { "maybe" })
+              $acc | upsert $fq {
+                dep: $crate_name,
+                ref_type: $ref_type,
+                uses: $uses
+              }
+            }
+        )
+
+        # IMPORTANT: pass rows_idx so _tree_from_fqpaths doesn't call rust-ast
+        let tree = (_tree_from_fqpaths $keep_fqs $leaf_info $rows_idx)
+
+        if ($wanted | length) == 1 {
+          return $tree
+        } else {
+          $out = ($out | append { dep: $crate_name, tree: $tree })
+        }
+      }
+    }
+    return $out
+  }
+
+  # ---------- original pretty printing path (unchanged except tighter BFS) ----------
+  for crate_name in $wanted {
+    let info = ($dep_index | get $crate_name | default { real: {}, maybe: {} })
+    let seeds_real_map   = ($info.real  | default {})
+    let seeds_maybe_map  = ($info.maybe | default {})
+    let seeds_real       = ($seeds_real_map  | columns | sort)
+    let seeds_maybe_all  = ($seeds_maybe_map | columns | sort)
+
+    if (($seeds_real | is-empty) and ($seeds_maybe_all | is-empty)) { continue }
+
+    print $"(ansi green)Dependency usage: (ansi red)($crate_name)(ansi reset)"
+
+    def _collect_ancestors [start_canon: string, maxd: int] {
+      mut seen = [$start_canon]
+      mut frontier = [$start_canon]
+      mut depth = 0
+      while ( $depth < $maxd ) {       # tightened from <= to <
+        mut nxt = []
+        for n in $frontier {
+          let parents = ($callers | get -i $n | default [])
+          for p in $parents {
+            if not ($seen | any {|x| $x == $p }) {
+              $seen = ($seen | append $p)
+              $nxt  = ($nxt  | append $p)
+            }
+          }
+        }
+        if ($nxt | is-empty) { break }
+        $frontier = $nxt
+        $depth = ($depth + 1)
+      }
+      $seen
+    }
+
+    mut on_path = {}
+    for s in $seeds_real {
+      let c = (_fq_canon $s)
+      let anc = (_collect_ancestors $c $max_depth)
+      for a in $anc { $on_path = ($on_path | upsert $a true) }
+    }
+    let seeds_maybe = (
+      $seeds_maybe_all
+      | where {|fq| ($on_path | get -i (_fq_canon $fq) | default false) }
+    )
+
+    if (not ($seeds_real | is-empty)) {
+      print $"(ansi dark_gray)direct references(ansi reset)"
+      for s in $seeds_real {
+        let c = (_fq_canon $s)
+        let sym_list = ($seeds_real_map | get -i $s | default [] | uniq | sort)
+        let sym_suffix = if ($sym_list | is-empty) { "" } else {
+          $" (ansi dark_gray)uses:(ansi reset) (ansi light_yellow)($sym_list | str join ', ')(ansi reset)"
+        }
+        let leaf = (_leaf $s)
+        let root_lbl = $"(ansi white)($leaf)(ansi reset)  (ansi dark_gray)[($s)](ansi reset)($sym_suffix)"
+        let lines = (_render_callers_tree $c $max_depth $callers $canon2real $root_lbl)
+        for ln in $lines { print $ln }
+        print ""
+      }
+    }
+
+    if $include_maybe and (not ($seeds_maybe | is-empty)) {
+      print $"(ansi dark_gray)[?] from glob imports(ansi reset)"
+      for s in $seeds_maybe {
+        let c = (_fq_canon $s)
+        let leaf = (_leaf $s)
+        let root_lbl = $"(ansi white)($leaf)(ansi reset)  (ansi dark_gray)[($s)](ansi reset)"
+        let lines = (_render_callers_tree $c $max_depth $callers $canon2real $root_lbl)
+        for ln in $lines { print $ln }
+        print ""
+      }
+    }
+  }
+}
