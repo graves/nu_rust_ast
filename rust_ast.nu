@@ -7,11 +7,11 @@
 # CLI-oriented Nushell helpers that scan a Rust crate (or given paths) with
 # ast-grep and produce:
 #   1) A FLAT TABLE of symbols with rich, normalized metadata (`rust-ast`)
-#   2) A NESTED SYMBOL TREE for pretty printing (`rust-tree` -> `print-symbol-tree`)
+#   2) A NESTED SYMBOL TREE for pretty printing (`rust-tree` -> `rust-print-symbol-tree`)
 #   3) A CALL GRAPH (both callees-of and callers-of) with cycle/dup handling
-#      (`print-call-graph`, internal walkers)
+#      (`rust-print-call-graph`, internal walkers)
 #   4) DEPENDENCY USAGE TREES per external crate, including grouped uses,
-#      alias resolution, and optional JSON-like nested records (`print-dep-usage`)
+#      alias resolution, and optional JSON-like nested records (`rust-print-dep-usage`)
 #
 # The tooling is designed so you can compose commands in pipelines, or call the
 # printers directly. All printers accept piped input where noted.
@@ -72,7 +72,7 @@
 # Produces a *minimal* nested tree of records for the crate rooted at "crate":
 #   { kind, name, fqpath, children: [...] }
 #
-#   rust-tree | print-symbol-tree [--fq-branches] [--tokens]
+#   rust-tree | rust-print-symbol-tree [--fq-branches] [--tokens]
 #
 # Pretty-prints the nested tree with columns:
 #   - Name:    tree branches + symbol name (colorized by kind)
@@ -87,9 +87,9 @@
 # - FQ paths are printed as plain text (no brackets).
 #
 # Examples:
-#   rust-tree | print-symbol-tree
-#   rust-tree | print-symbol-tree --fq-branches
-#   rust-tree | print-symbol-tree --tokens
+#   rust-tree | rust-print-symbol-tree
+#   rust-tree | rust-print-symbol-tree --fq-branches
+#   rust-tree | rust-print-symbol-tree --tokens
 #
 # =============================================================================
 # 3) CALL GRAPH (CALLEES / CALLERS)
@@ -99,14 +99,21 @@
 # stripped segment-wise) and a map from canonical → real fqpaths so display shows
 # real names even when multiple canonical variants exist.
 #
-#   print-call-graph <pattern>
+#   rust-print-call-graph <pattern>
 #     [--max-depth <N>=3] [--reverse] [--show-roots]
 #
 # - <pattern> can be an exact fqpath ("crate::api::ask"), a module tail
 #   ("::ask"), or a bare name ("ask"); multiple matches will render sequentially.
-# - Forward (default): "→ callees of" graph, rooted at seed(s)
-# - Reverse (--reverse): "← callers of" graph, rooted at seed(s)
-# - --show-roots prints a one-line header for each root
+# - Default (no flags): **inverted callers** view — top-down from *roots* (callers)
+#   to the *target* (leaf). This answers “who (eventually) calls X?” while keeping
+#   X at the end of each branch.
+# - --reverse: **bottom-up callers** view — the older style that starts at the
+#   *target* and expands upward to its parents.
+# - --show-roots prints a one-line header for each root. The header looks like:
+#     Call graph depth: N ← callers (inverted) crate::api::prepare_messages
+#   for the default inverted view, and:
+#     Call graph depth: N ← callers crate::api::prepare_messages
+#   for the bottom-up (--reverse) view.
 # - Leaf column shows the *name* (last path segment) and the full fqpath in
 #   brackets, e.g.:
 #       ask  [crate::api::ask]
@@ -115,12 +122,12 @@
 # -------------------
 # Walkers track a visited set and annotate loops (⟲ cycle). Repeated nodes are
 # printed once per path and not expanded again, preventing combinatorial blowups.
-#
+# 
 # =============================================================================
 # 4) DEPENDENCY USAGE (EXTERNAL CRATES)
 # =============================================================================
 #
-#   print-dep-usage [<crate>] [--max-depth <N>=4] [--include-maybe] [--records]
+#   rust-print-dep-usage [<crate>] [--max-depth <N>=4] [--include-maybe] [--records]
 #
 # Scans functions to find references to external crates, using:
 #   - explicit paths (e.g., `serde::Serialize::serialize`)
@@ -179,30 +186,37 @@
 # =============================================================================
 #
 # - Most printers accept piped rows from `rust-ast` to avoid re-scanning:
-#     rust-ast | print-dep-usage serde
-#     rust-ast | print-dep-usage --records | to json
+#     rust-ast | rust-print-dep-usage serde
+#     rust-ast | rust-print-dep-usage --records | to json
 #
-# - `print-symbol-tree` expects the *nested* shape from `rust-tree`:
-#     rust-tree | print-symbol-tree --tokens
+# - `rust-print-symbol-tree` expects the *nested* shape from `rust-tree`:
+#     rust-tree | rust-print-symbol-tree --tokens
 #
 # =============================================================================
 # 7) QUICK RECIPES
 # =============================================================================
 #
-# - Show a colorized, aligned tree of your crate (no uses):
-#     rust-tree | print-symbol-tree
+# - Query the filename, function name, fully qualified path and callers of
+#   the first 5 functions returned by rust-ast:
+#     rust-ast | where kind == 'fn' | select file name fqpath callers | first 5
+#
+# - Show a colorized, aligned tree of your crate (no use imports):
+#     rust-tree | rust-print-symbol-tree
 #
 # - Same, with fqpath on every node and token counts aligned to the right:
-#     rust-tree | print-symbol-tree --fq-branches --tokens
+#     rust-tree | rust-print-symbol-tree --fq-branches --tokens
 #
-# - Who calls `crate::api::prepare_messages` (up to 5 levels)?
-#     print-call-graph crate::api::prepare_messages --reverse --max-depth 5 --show-roots
+# - Who calls `crate::api::prepare_messages` (top-down, up to 5 levels)?
+#    rust-print-call-graph crate::api::prepare_messages --max-depth 5 --show-roots
 #
+# - Same question, legacy bottom-up view (target first, then parents):
+#     rust-print-call-graph crate::api::prepare_messages --reverse --max-depth 5 --show-roots
+# 
 # - Where do we reference `serde`? (pretty)
-#     print-dep-usage serde --max-depth 5 --include-maybe
+#     rust-print-dep-usage serde --max-depth 5 --include-maybe
 #
 # - Where do we reference `serde`? (structured)
-#     rust-ast | print-dep-usage serde --records | to json
+#     rust-print-dep-usage serde --records | to json
 #
 # =============================================================================
 # IMPLEMENTATION NOTES (highlights)
@@ -219,7 +233,7 @@
 #   visited nodes are shown once with a ⟲ marker and not expanded again.
 #
 # - Performance: Most builders accept piped input to avoid re-running `rust-ast`.
-#   `print-dep-usage --records` shares the row index with the tree builder to
+#   `rust-print-dep-usage --records` shares the row index with the tree builder to
 #   prevent re-computation.
 #
 # =============================================================================
@@ -246,7 +260,7 @@ export def rust-ast [...paths:string] {
 }
 
 # # Nested structure of symbols — MINIMAL payload (kind, name, fqpath, children).
-# This is exactly what `print-symbol-tree` expects to render/align/paint columns.
+# This is exactly what `rust-print-symbol-tree` expects to render/align/paint columns.
 export def rust-tree [
   ...paths:string
   --include-use
@@ -278,7 +292,7 @@ export def rust-tree [
 }
 
 # =============================================================================
-# print-symbol-tree — Pretty-print a nested Rust symbol tree with columns
+# rust-print-symbol-tree — Pretty-print a nested Rust symbol tree with columns
 # =============================================================================
 # Works with the nested output from `rust-tree`.
 #
@@ -297,10 +311,10 @@ export def rust-tree [
 #   FQ paths are printed as plain text (no brackets).
 #
 # Usage:
-#   rust-tree | print-symbol-tree
-#   rust-tree | print-symbol-tree --fq-branches
-#   rust-tree | print-symbol-tree --tokens
-#   rust-tree | print-symbol-tree --fq-branches --tokens
+#   rust-tree | rust-print-symbol-tree
+#   rust-tree | rust-print-symbol-tree --fq-branches
+#   rust-tree | rust-print-symbol-tree --tokens
+#   rust-tree | rust-print-symbol-tree --fq-branches --tokens
 #
 # Options:
 #   --fq-branches    Show fqpath on branch nodes too (defaults to leaves only).
@@ -312,14 +326,14 @@ export def rust-tree [
 #   - If your terminal or platform doesn't support ANSI, you'll still get
 #     correct spacing (we measure visible length with `ansi strip`).
 # =============================================================================
-export def print-symbol-tree [
+export def rust-print-symbol-tree [
   --fq-branches
   --tokens                     # <-- new flag
 ] {
   let input = $in
   let roots = (_roots-of $input)
   if ($roots | is-empty) {
-    error make { msg: "print-symbol-tree: input contains no records" }
+    error make { msg: "rust-print-symbol-tree: input contains no records" }
   }
 
   let rows = (
@@ -1669,13 +1683,6 @@ export def rust-use-records [...paths:string] {
 
 # ---------- nesting helpers (for rust-tree) ----------------------------------
 
-def _index-by-fq [rows:list<record>] {
-  $rows
-  | where {|r| ($r | get -i fqpath | default '') != '' }
-  | group-by fqpath
-  | transpose fq rows
-}
-
 # Build parent→children edges (each as fq strings)
 def _build-symbol-edges [rows:list<record>] {
   let keyed = ($rows | where {|r| ($r | get -i fqpath | default '') != '' })
@@ -1715,40 +1722,6 @@ def _paint-kind [kind:string, text:string] {
     "macro_rules" => $"(ansi dark_gray)($t)(ansi reset)"  # or purple
     "use"        => $"(ansi white_dimmed)($t)(ansi reset)"  # “dim” style
     _            => $t
-  }
-}
-
-# Build a nested node: take the canonical row for `fq` and attach `children: [...]`
-def _nest-node [
-  rows:list<record>,
-  edges:list<record<parent: string, children: list<string>>>,
-  index:list<record<fq: string, rows: list<record>>>,
-  fq:string
-] {
-  let r0 = (
-    $index
-    | where fq == $fq
-    | get 0?
-    | get -i rows
-    | get 0?
-    | default null
-  )
-
-  let kids = (
-    $edges
-    | where parent == $fq
-    | get 0?
-    | get -i children
-    | default []
-  )
-
-  let children = $kids
-    | each {|cfq| _nest-node $rows $edges $index $cfq }
-
-  if $r0 == null {
-    { kind: 'node', name: ($fq | split row '::' | last), fqpath: $fq, children: $children }
-  } else {
-    $r0 | upsert children $children
   }
 }
 
@@ -1844,12 +1817,12 @@ def _roots-of [x: any] {
   } else if $t == 'string' {
     let parsed = (try { $x | from json } catch { null })
     if $parsed == null {
-      error make { msg: "print-symbol-tree: got a string that isn't JSON" }
+      error make { msg: "rust-print-symbol-tree: got a string that isn't JSON" }
     } else {
       _roots-of $parsed
     }
   } else {
-    error make { msg: $"print-symbol-tree: unsupported input type: ($t)" }
+    error make { msg: $"rust-print-symbol-tree: unsupported input type: ($t)" }
   }
 }
 
@@ -1995,9 +1968,11 @@ def _print-with-columns [
       }
     } else { "" }
 
+    let prefix_gray = $"(ansi dark_gray)($r.line_prefix)(ansi reset)"
+
     # Assemble line
     mut parts = [
-      $r.line_prefix,
+      $prefix_gray,
       $name_col,              # painted name
       (_spaces $pad),
       "| ",
@@ -2013,48 +1988,6 @@ def _print-with-columns [
 
 def _vlen [s: any] {
   ($s | into string | ansi strip | str length)
-}
-
-# =============================================================================
-# call graph (edges + printer)
-# =============================================================================
-
-# Build unique edges with *both* real and canonical fqpaths
-def _build-call-edges [rows:list<record>] {
-  let fns = ($rows | where {|r| ($r | get -i kind | default '') == 'fn' })
-
-  let files = (
-    $rows
-    | each {|r| ($r | get -i file | default null) }
-    | where {|f| $f != null }
-    | uniq
-  )
-
-  let calls    = (_rust-call-sites-on $files)
-  let fn_index = (_index-fns-by-file $fns)
-  let idx      = (_build-fn-indexes $fns)
-
-  $calls
-  | each {|c|
-      let caller = (_enclosing-fn $fn_index $c.file ($c.span.start_byte | default 0) ($c.span.end_byte | default 0))
-      if $caller == null { null } else {
-        let target = (_resolve-call $idx $fns $c $caller)
-        if $target == null { null } else {
-          let caller_fq = ($caller.fqpath | default '')
-          let callee_fq = ($target.fqpath | default '')
-          if $caller_fq == '' or $callee_fq == '' { null } else {
-            {
-              caller: $caller_fq,
-              callee: $callee_fq,
-              caller_c: (_fq_canon $caller_fq),
-              callee_c: (_fq_canon $callee_fq),
-            }
-          }
-        }
-      }
-    }
-  | where {|e| $e != null }
-  | uniq
 }
 
 # Map a free-form pattern → seed fqpaths to start the graph from
@@ -2074,24 +2007,30 @@ def _lookup-fn-seeds [fns:list<record>, pattern:string] {
   }
 }
 
+# Walk a *canonical* adjacency but print the *real* fqpaths.
 def _walk-fq-tree [
-  adj: record,                 # canonical -> [canonical]
-  canon2real: record,          # canonical -> [real fq]
-  node_c: string,              # canonical seed
+  adj: record,
+  canon2real: record,
+  node_c: string,
   max_depth: int,
   ancestors_last: list<bool> = [],
-  visited: list<string> = [],  # canonical
+  visited: list<string> = [],
+  is_last: bool = true,
 ] {
   let is_cycle = ($visited | any {|v| $v == $node_c })
-  let indent   = ($ancestors_last | each {|last| if $last { "   " } else { "|  " } } | str join "")
-  let tee      = (if ($ancestors_last | length) == 0 { "" } else { "|- " })
+  let indent = ($ancestors_last | each {|last| if $last { "   " } else { "|  " } } | str join "")
+  let tee    = (if ($ancestors_last | length) == 0 { "" } else { if $is_last { "`- " } else { "|- " } })
   let face_fq  = (try { $canon2real | get $node_c | get 0 } catch { $node_c })
   let face_nm  = (_leaf-name $face_fq)
 
-  mut out = [ $"($indent)($tee)(ansi white)($face_nm)(ansi reset)  (ansi dark_gray)[($face_fq)](ansi reset)" ]
+  # branch chars (indent + tee) now gray like fqpaths
+  mut out = [
+    $"(ansi dark_gray)($indent)($tee)(ansi reset)(ansi white)($face_nm)(ansi reset)  (ansi dark_gray)[($face_fq)](ansi reset)"
+  ]
 
-  if $is_cycle or $max_depth <= 0 { 
-    if $is_cycle { let out = ($out | append $"($indent)   (ansi red)⟲ cycle(ansi reset)") }
+  if $is_cycle or $max_depth <= 0 {
+    # keep the branch padding gray here too
+    if $is_cycle { let out = ($out | append $"(ansi dark_gray)($indent)   (ansi red)⟲ cycle(ansi reset)") }
     return $out
   }
 
@@ -2099,100 +2038,252 @@ def _walk-fq-tree [
   let n = ($kids | length)
   for i in 0..<( $n ) {
     let ch = ($kids | get $i)
-    let sub = _walk-fq-tree $adj $canon2real $ch ($max_depth - 1) ($ancestors_last | append ($i == ($n - 1))) ($visited | append $node_c)
+    let lastf = ($i == ($n - 1))
+    let sub = _walk-fq-tree $adj $canon2real $ch ($max_depth - 1) ($ancestors_last | append $is_last) ($visited | append $node_c) $lastf
     $out = ($out | append $sub)
   }
-  $out
-}
 
-# Build canonical adjacency and a mapping from canonical -> set of real fqpaths
-def _adjacency-from-edges [
-  edges:list<record<caller:string, callee:string, caller_c:string, callee_c:string>>,
-  reverse: bool = false
-] {
-  let adj = (
-    $edges
-    | reduce -f {} {|e, acc|
-        let from_c = (if $reverse { $e.callee_c } else { $e.caller_c })
-        let to_c   = (if $reverse { $e.caller_c } else { $e.callee_c })
-        let cur    = (try { $acc | get $from_c } catch { [] })
-        let nxt    = ($cur | append $to_c | uniq | sort)
-        $acc | upsert $from_c $nxt
-      }
-  )
-  let canon2real = (
-    $edges
-    | reduce -f {} {|e, acc|
-        let a1 = ($acc | upsert $e.caller_c ((try { $acc | get $e.caller_c } catch { [] }) | append $e.caller | uniq | sort))
-        let a2 = ($a1   | upsert $e.callee_c ((try { $a1  | get $e.callee_c } catch { [] }) | append $e.callee | uniq | sort))
-        $a2
-      }
-  )
-  { adj: $adj, canon2real: $canon2real }
+  $out
 }
 
 def _leaf [fq:string] { $fq | split row '::' | last }
 
-# Walk a *canonical* adjacency but print the *real* fqpaths.
-def _walk-call-graph [
-  adj: record,               # canonical -> [canonical]
-  canon2real: record,        # canonical -> [real fqpaths]
-  node_c: string,            # canonical fqpath of current node
-  max_depth: int,
-  ancestors_last: list<bool> = [],
-  visited: list<string> = [] # canonical seen
-] {
-  let is_cycle = ($visited | any {|v| $v == $node_c })
-  let prefix   = ($ancestors_last | each {|last| if $last { "   " } else { "|  " } } | str join "")
-  let tee      = (if ($ancestors_last | length) == 0 { "" } else { "|- " })
-  let real0    = (try { $canon2real | get $node_c | get 0 } catch { $node_c })
-  let face_nm  = (_leaf-name $real0)
+# Render callers but inverted: show roots at the top and the seed as the leaf on every branch.
+def _render_callers_tree_inverted [root maxd callers canon2real] {
 
-  mut out = [ $"($prefix)($tee)(ansi white)($face_nm)(ansi reset)  (ansi dark_gray)[($real0)](ansi reset)" ]
+  let C_hdr = (ansi cyan)
+  let C_fn  = (ansi white)
+  let C_fq  = (ansi dark_gray)
+  let C_br  = (ansi dark_gray)
+  let R     = (ansi reset)
 
-  if $is_cycle or $max_depth <= 0 {
-    if $is_cycle { let out = ($out | append $"($prefix)   (ansi red)⟲ cycle detected(ansi reset)") }
-    return $out
+  def _fq_of [canon canon2real] {
+    let v = ($canon2real | get -i $canon | default [])
+    if ($v | length) > 0 { $v | get 0 } else { $canon }
   }
 
-  let children_c = (try { $adj | get $node_c } catch { [] }) | default [] | uniq | sort
-  let n = ($children_c | length)
-  for i in 0..<( $n ) {
-    let ch_c = ($children_c | get $i)
-    let sub = _walk-call-graph $adj $canon2real $ch_c ($max_depth - 1) ($ancestors_last | append ($i == ($n - 1))) ($visited | append $node_c)
-    $out = ($out | append $sub)
+  let root_fq    = (_fq_of $root $canon2real)
+  let root_short = ($root_fq | split row '::' | last)
+
+  # depth-first over PARENTS, printing each parent chain downward to the seed leaf
+  def _go_up [node prefix depth_left callers canon2real seen is_last] {
+    let fq    = (_fq_of $node $canon2real)
+    let short = ($fq | split row '::' | last)
+
+    let branch = (if $is_last { "`- " } else { "|- " })
+    let cont   = (if $is_last { "   " } else { "|  " })
+
+    # current parent line
+    mut out = [ $"(ansi dark_gray)($prefix)($branch)(ansi reset)(ansi white)($short)(ansi reset)  (ansi dark_gray)[($fq)](ansi reset)" ]
+
+    # cycle guard
+    if ($seen | any {|x| $x == $node }) {
+      $out = ($out | append $"(ansi dark_gray)($prefix)($cont)(ansi reset)(ansi red)⟲ cycle(ansi reset)")
+      # still terminate this path with the seed for consistency
+      $out = ($out | append $"(ansi dark_gray)($prefix)($cont)`- (ansi reset)(ansi white)($root_short)(ansi reset)  (ansi dark_gray)[($root_fq)](ansi reset)")
+      return $out
+    }
+
+    # next parents (i.e., expand upward)
+    let parents = ($callers | get -i $node | default [] | uniq | sort)
+    if ($parents | is-empty) or ($depth_left <= 1) {
+      # terminate branch with the seed as a leaf
+      $out = ($out | append $"(ansi dark_gray)($prefix)($cont)`- (ansi reset)(ansi white)($root_short)(ansi reset)  (ansi dark_gray)[($root_fq)](ansi reset)")
+      return $out
+    }
+
+    let last_idx = (($parents | length) - 1)
+    for it in ($parents | enumerate) {
+      let p       = $it.item
+      let i       = $it.index
+      let lastf   = ($i == $last_idx)
+      let sub     = (_go_up $p $"($prefix)($cont)" ($depth_left - 1) $callers $canon2real ($seen | append $node) $lastf)
+      $out = ($out | append $sub)
+    }
+
+    $out
+  }
+
+  let header = [
+    $C_hdr, "Call graph depth: ", ($maxd | into string), (ansi reset),
+    (ansi dark_gray), "← callers ", "(inverted)", (ansi reset), " ",
+    (ansi white), $root_fq, (ansi reset)
+  ] | str join ""
+
+  let parents = ($callers | get -i $root | default [] | uniq | sort)
+  if ($parents | is-empty) {
+    # no callers → nothing to invert; still show a header and a single leaf
+    [ $header, $"(ansi white)($root_short)(ansi reset)  (ansi dark_gray)[($root_fq)](ansi reset)" ]
+  } else {
+    let last_idx = (($parents | length) - 1)
+    mut lines = [ $header ]
+    for it in ($parents | enumerate) {
+      let p     = $it.item
+      let i     = $it.index
+      let lastf = ($i == $last_idx)
+      let sub   = (_go_up $p "" $maxd $callers $canon2real [] $lastf)
+      $lines = ($lines | append $sub)
+    }
+    $lines
+  }
+}
+
+# Collect the ancestors (within max_depth) of a target canon and turn
+# the callers adjacency (callee <- caller) into a forward map (parent → child)
+def _build_inverted_callers_forest [
+  callers: record,      # map<canon -> list<canon>>    (callee -> callers)
+  target_c: string,     # canon of the target function
+  maxd: int
+] {
+  # BFS upward to collect nodes/edges within depth
+  mut seen_depth = { $target_c: 0 }
+  mut frontier = [ $target_c ]
+  mut edges = []   # list of { parent: <caller>, child: <callee> } (forward)
+
+  mut d = 0
+  while $d < $maxd and (not ($frontier | is-empty)) {
+    mut next = []
+    for child in $frontier {
+      let parents = (try { $callers | get $child } catch { [] }) | default []
+      for p in ($parents | uniq | sort) {
+        # record edge p -> child (toward the target)
+        $edges = ($edges | append { parent: $p, child: $child })
+        let prior = (try { $seen_depth | get $p } catch { null })
+        if $prior == null {
+          $seen_depth = ($seen_depth | upsert $p ($d + 1))
+          $next = ($next | append $p)
+        }
+      }
+    }
+    $frontier = $next
+    $d = ($d + 1)
+  }
+
+  # Nodes participating in the forest
+  let nodes = ($seen_depth | columns | append $target_c | uniq | sort)
+
+  # Forward adjacency (parent -> [children]) restricted to collected nodes
+  let fwd = (
+    $edges
+    | where {|e| ($nodes | any {|n| $n == $e.parent}) and ($nodes | any {|n| $n == $e.child}) }
+    | group-by parent
+    | transpose parent rows
+    | reduce -f {} {|g, acc| $acc | upsert $g.parent ($g.rows | get child | uniq | sort) }
+  )
+
+  # Compute roots of the forest (parents that are never a child)
+  let all_parents = ($edges | get -i parent | default [] | uniq | sort)
+  let all_children = ($edges | get -i child  | default [] | uniq | sort)
+  let roots = ($all_parents | where {|p| not ($all_children | any {|c| $c == $p }) })
+
+  { fwd: $fwd, roots: ($roots | default []) }
+}
+
+def _render_callers_forest_inverted [
+  forest: record,       # { fwd: record, roots: list<string> }
+  canon2real: record,
+  target_c: string
+] {
+  let C_fn = (ansi white)
+  let C_fq = (ansi dark_gray)
+  let C_br = (ansi dark_gray)
+  let R    = (ansi reset)
+
+  def _fq_of [canon canon2real] {
+    let v = ($canon2real | get -i $canon | default [])
+    if ($v | length) > 0 { $v | get 0 } else { $canon }
+  }
+
+  def _label [prefix branch node_c canon2real] {
+    let fq    = (_fq_of $node_c $canon2real)
+    let short = ($fq | split row '::' | last)
+    $"($C_br)($prefix)($branch)($R)($C_fn)($short)($R)  ($C_fq)[($fq)]($R)"
+  }
+
+  def _walk [node_c prefix is_last fwd canon2real target_c visited:list<string>] {
+    let branch = (if $prefix == "" { "" } else { if $is_last { "`- " } else { "|- " } })
+    let line = (_label $prefix $branch $node_c $canon2real)
+
+    # stop expanding at the target (it must be a leaf in the inverted view)
+    if $node_c == $target_c {
+      return [ $line ]
+    }
+
+    # cycle guard
+    if ($visited | any {|x| $x == $node_c }) {
+      return [ $line ]
+    }
+
+    let kids = (try { $fwd | get $node_c } catch { [] }) | default []
+    if ($kids | is-empty) {
+      return [ $line ]
+    }
+
+    let cont = (if $is_last { "   " } else { "|  " })
+    let last_idx = (($kids | length) - 1)
+
+    mut out = [ $line ]
+    for it in ($kids | enumerate) {
+      let ch = $it.item
+      let il = ($it.index == $last_idx)
+      let sub = (_walk $ch $"($prefix)($cont)" $il $fwd $canon2real $target_c ($visited | append $node_c))
+      $out = ($out | append $sub)
+    }
+    $out
+  }
+
+  # Top-level: render each root as a branch under a virtual top
+  let roots = ($forest.roots | default [] | uniq | sort)
+  mut out = []
+  for it in ($roots | enumerate) {
+    let r = $it.item
+    let il = ($it.index == (($roots | length) - 1))
+    let lines = (_walk $r "" $il $forest.fwd $canon2real $target_c [])
+    $out = ($out | append $lines)
   }
   $out
 }
 
-export def print-call-graph [
+export def rust-print-call-graph [
   pattern:string,
   --max-depth:int = 3,
-  --reverse,       # callers-of when set; else callees-of
+  --reverse,       # callers-of (bottom-up) when set; default: inverted callers (top-down to target)
   --show-roots,
 ] {
-  let rows = (rust-ast)              # already includes callers via _attach_callers
+  let rows = (rust-ast)
   let fns  = ($rows | where kind == 'fn')
 
   let seeds_real = (_lookup-fn-seeds $fns $pattern)
   if ($seeds_real | is-empty) {
-    error make { msg: $"print-call-graph: no function matched: '($pattern)'" }
+    error make { msg: $"rust-print-call-graph: no function matched: '($pattern)'" }
   }
   let seeds_c = ($seeds_real | each {|fq| _fq_canon $fq } | uniq)
 
   let built = (_adj_from_rows $rows)
-  let adj   = (if ($reverse | default false) { $built.callers_of } else { $built.callees_of })
-  let map   = $built.canon2real
+  let callers = $built.callers_of
+  let map     = $built.canon2real
 
   for root_c in $seeds_c {
-    # Prefer a real fq from canon→real; fall back to the matching seed
-    let root_real = (try { $map | get $root_c | get 0 } catch { ($seeds_real | where {|fq| (_fq_canon $fq) == $root_c } | get 0) })
-    if ($show_roots | default false) {
-      let dir = (if ($reverse | default false) { "← callers of" } else { "→ callees of" })
-      print $"(ansi cyan)Call graph depth: ($max_depth) (ansi reset)(ansi dark_gray)($dir)(ansi reset) (ansi white)($root_real)(ansi reset)"
+    let root_fq = (try { $map | get $root_c | get 0 } catch { ($seeds_real | where {|fq| (_fq_canon $fq) == $root_c } | get 0) })
+
+    if ($reverse | default false) {
+      # Existing bottom-up callers view (target first, then parents)
+      if ($show_roots | default false) {
+        print $"(ansi cyan)Call graph depth: ($max_depth) (ansi reset)(ansi dark_gray)← callers \(inverted\)(ansi reset) (ansi white)($root_fq)(ansi reset)"
+      }
+      let lines = (_render_callers_tree $root_c $max_depth $callers $map "")
+      for ln in $lines { print $ln }
+    } else {
+      # NEW default: inverted callers view (top-down; target is the leaf)
+      if ($show_roots | default false) {
+        # note: escape parentheses
+        print $"(ansi cyan)Call graph depth: ($max_depth) (ansi reset)(ansi dark_gray)← callers(ansi reset) (ansi white)($root_fq)(ansi reset)"
+      }
+      let forest = (_build_inverted_callers_forest $callers $root_c $max_depth)
+      let lines  = (_render_callers_forest_inverted $forest $map $root_c)
+      for ln in $lines { print $ln }
     }
-    let lines = _walk-fq-tree $adj $map $root_c $max_depth [] []
-    for ln in $lines { print $ln }
+
     if ($seeds_c | length) > 1 { print "" }
   }
 }
@@ -2208,21 +2299,6 @@ def _fq_split [fq:string] {
     | each {|i| ($parts | take ($i + 1) | str join '::') }
   )
   [ $mods, $leaf ]
-}
-
-# Paint a module name (folder-like) and a function name (leaf-like)
-def _paint-node-line [fq:string, kind:string] {
-  let name = ($fq | split row '::' | last)
-  match $kind {
-    "mod" => $"(ansi blue)($name)(ansi reset)  (ansi dark_gray)[($fq)](ansi reset)"
-    "fn"  => $"(ansi white)($name)(ansi reset)  (ansi dark_gray)[($fq)](ansi reset)"
-    _     => $"(ansi white)($name)(ansi reset)  (ansi dark_gray)[($fq)](ansi reset)"
-  }
-}
-
-# Decide if an fqpath is a known function
-def _is_fn_fq [fn_index:list<record<fqpath: string>> , fq:string] {
-  ($fn_index | where fqpath == $fq | length) > 0
 }
 
 # Map: module_path -> { alias_or_leaf -> external_crate_name }
@@ -2423,41 +2499,10 @@ def _ext_globs_by_module [rows:list<record>] {
   | reduce -f {} {|it, acc| $acc | upsert $it.mod ($it.items | get ext | uniq | sort) }
 }
 
-# Walk callers-of adjacency to roots, printing a tree (internal-only nodes).
-def _walk-callers-tree [
-  callers_of: record,           # canon -> [canon callers]
-  canon2real: record,           # canon -> [real fqs]
-  node_c: string,
-  max_depth:int,
-  ancestors_last:list<bool> = [],
-  visited:list<string> = []
-] {
-  let cyc = ($visited | any {|v| $v == $node_c })
-  let prefix = ($ancestors_last | each {|last| if $last { "   " } else { "|  " } } | str join "")
-  let tee    = (if ($ancestors_last | length) == 0 { "" } else { "|- " })
-  let real0  = (try { $canon2real | get $node_c | get 0 } catch { $node_c })
-  mut out = [ $"($prefix)($tee)(ansi white)($real0 | split row '::' | last)(ansi reset)  (ansi dark_gray)[($real0)](ansi reset)" ]
-
-  if $cyc or $max_depth <= 0 {
-    if $cyc { let out = ($out | append $"($prefix)   (ansi red)⟲ cycle(ansi reset)") }
-    return $out
-  }
-
-  let parents = (try { $callers_of | get $node_c } catch { [] }) | default [] | uniq | sort
-  let n = ($parents | length)
-  for i in 0..<( $n ) {
-    let p = ($parents | get $i)
-    let sub = _walk-callers-tree $callers_of $canon2real $p ($max_depth - 1) ($ancestors_last | append ($i == ($n - 1))) ($visited | append $node_c)
-    let out = ($out | append $sub)
-  }
-  $out
-}
-
-# Renders a callers tree (up to max depth) for a canon name.
+# Renders a callers tree (up to max depth) for a canon name (ASCII branches).
 # callers: map<canon -> list<canon>>
 # canon2real: map<canon -> list<fqpath>>
 def _render_callers_tree [root maxd callers canon2real root_label?: string] {
-
   let C_hdr = (ansi cyan)
   let C_fn  = (ansi white)
   let C_fq  = (ansi dark_gray)
@@ -2469,50 +2514,45 @@ def _render_callers_tree [root maxd callers canon2real root_label?: string] {
     if ($v | length) > 0 { $v | get 0 } else { $canon }
   }
 
-  # --- add: seen set to avoid repeats (see §2) ---
   def _go [node prefix depth_left callers canon2real seen:list<string>] {
     if $depth_left <= 0 { return [] }
-
     let parents = ($callers | get -i $node | default [] | enumerate)
     if ($parents | is-empty) { return [] }
-
     let last_idx = (($parents | length) - 1)
     mut out = []
     for it in $parents {
-      let p = $it.item
-      let i = $it.index
+      let p       = $it.item
+      let i       = $it.index
       let is_last = ($i == $last_idx)
-      let branch  = (if $is_last { "└─ " } else { "├─ " })
-      let cont    = (if $is_last { "   " } else { "│  " })
+      let branch  = (if $is_last { "`- " } else { "|- " })
+      let cont    = (if $is_last { "   " } else { "|  " })
 
       let fq    = (_fq_of $p $canon2real)
       let short = (_leaf $fq)
 
-      # if we've already shown this node, mark and don’t expand it again
       if ($seen | any {|x| $x == $p }) {
-        let line = $"($C_br)($prefix)($branch)($R)($C_fn)($short)($R)  ($C_fq)[($fq)] (ansi red)⟲(ansi reset)"
+        let line = $"($C_fq)($prefix)($branch)($R)($C_fn)($short)($R)  ($C_fq)[($fq)] (ansi red)⟲(ansi reset)"
         $out = ($out | append $line)
         continue
       }
 
-      let line = $"($C_br)($prefix)($branch)($R)($C_fn)($short)($R)  ($C_fq)[($fq)]($R)"
+      let line = $"($C_fq)($prefix)($branch)($R)($C_fn)($short)($R)  ($C_fq)[($fq)]($R)"
       $out = ($out | append $line)
       $out = ($out | append (_go $p $"($prefix)($cont)" ($depth_left - 1) $callers $canon2real ($seen | append $p)))
     }
     $out
   }
 
-  let header = $"($C_hdr)Call graph depth: ($maxd) ← callers of (_fq_of $root $canon2real)($R)"
-
-  let first  = if ($root_label | default '' | str length) > 0 {
+  # NOTE: no header emitted here anymore
+  let fq0   = (_fq_of $root $canon2real)
+  let short = (_leaf $fq0)
+  let first = if ($root_label | default '' | str length) > 0 {
     $root_label
   } else {
-    let fq0   = (_fq_of $root $canon2real)
-    let short = (_leaf $fq0)
     $"($C_fn)($short)($R)  ($C_fq)[($fq0)]($R)"
   }
 
-  [ $header, $first ] | append (_go $root "" $maxd $callers $canon2real [])
+  [ $first ] | append (_go $root "" $maxd $callers $canon2real [])
 }
 
 def _leaf-name [fq:string] {
@@ -2608,12 +2648,12 @@ def _tree_from_fqpaths [
   [ (_nest "crate") ]
 }
 
-# --- modify: print-dep-usage to support --records output and piped rows (no nested rust-ast calls)
-export def print-dep-usage [
+export def rust-print-dep-usage [
   dep?: string
   --max-depth:int = 4
   --include-maybe
   --records                 # emit nested records instead of pretty text
+  --reverse                 # when set, use legacy bottom-up callers view; default is inverted callers (top-down to target)
 ] {
   # Prefer piped rows if present
   let piped = $in
@@ -2627,7 +2667,7 @@ export def print-dep-usage [
 
   let ext_set = (_external-crate-set)
   if ($ext_set | is-empty) {
-    error make { msg: "print-dep-usage: no external deps found in Cargo.toml" }
+    error make { msg: "rust-print-dep-usage: no external deps found in Cargo.toml" }
   }
 
   let scanned    = (_scan-ext-refs-on-fns $rows)
@@ -2674,7 +2714,7 @@ export def print-dep-usage [
     ($dep_index | columns | sort)
   }
 
-  # If --records is set: build nested trees (one per dep if dep not specified; else just the tree)
+  # If --records is set: structural output is unaffected by --reverse (orientation only applies to pretty text mode)
   if $records {
     mut out = []
     for crate_name in $wanted {
@@ -2687,7 +2727,7 @@ export def print-dep-usage [
         mut seen = [$start_canon]
         mut frontier = [$start_canon]
         mut depth = 0
-        while ( $depth < $maxd ) {     # tightened from <= to <
+        while ( $depth < $maxd ) {
           mut nxt = []
           for n in $frontier {
             let parents = ($callers | get -i $n | default [])
@@ -2736,7 +2776,7 @@ export def print-dep-usage [
             }
         )
 
-        # IMPORTANT: pass rows_idx so _tree_from_fqpaths doesn't call rust-ast
+        # pass rows_idx so _tree_from_fqpaths doesn't call rust-ast
         let tree = (_tree_from_fqpaths $keep_fqs $leaf_info $rows_idx)
 
         if ($wanted | length) == 1 {
@@ -2749,7 +2789,7 @@ export def print-dep-usage [
     return $out
   }
 
-  # ---------- original pretty printing path (unchanged except tighter BFS) ----------
+  # ---------- pretty printing path (now supports --reverse) ----------
   for crate_name in $wanted {
     let info = ($dep_index | get $crate_name | default { real: {}, maybe: {} })
     let seeds_real_map   = ($info.real  | default {})
@@ -2765,7 +2805,7 @@ export def print-dep-usage [
       mut seen = [$start_canon]
       mut frontier = [$start_canon]
       mut depth = 0
-      while ( $depth < $maxd ) {       # tightened from <= to <
+      while ( $depth < $maxd ) {
         mut nxt = []
         for n in $frontier {
           let parents = ($callers | get -i $n | default [])
@@ -2802,10 +2842,21 @@ export def print-dep-usage [
         let sym_suffix = if ($sym_list | is-empty) { "" } else {
           $" (ansi dark_gray)uses:(ansi reset) (ansi light_yellow)($sym_list | str join ', ')(ansi reset)"
         }
-        let leaf = (_leaf $s)
-        let root_lbl = $"(ansi white)($leaf)(ansi reset)  (ansi dark_gray)[($s)](ansi reset)($sym_suffix)"
-        let lines = (_render_callers_tree $c $max_depth $callers $canon2real $root_lbl)
-        for ln in $lines { print $ln }
+        if ($reverse | default false) {
+          # legacy bottom-up callers view (target first, then parents)
+          let leaf = (_leaf $s)
+          let root_lbl = $"(ansi white)($leaf)(ansi reset)  (ansi dark_gray)[($s)](ansi reset)($sym_suffix)"
+          let lines = (_render_callers_tree $c $max_depth $callers $canon2real $root_lbl)
+          for ln in $lines { print $ln }
+        } else {
+          # default: inverted callers view (top-down; target is the leaf)
+          # show the seed line with uses, then render the inverted forest
+          let leaf = (_leaf $s)
+          print $"(ansi white)($leaf)(ansi reset)  (ansi dark_gray)[($s)](ansi reset)($sym_suffix)"
+          let forest = (_build_inverted_callers_forest $callers $c $max_depth)
+          let lines  = (_render_callers_forest_inverted $forest $canon2real $c)
+          for ln in $lines { print $ln }
+        }
         print ""
       }
     }
@@ -2814,10 +2865,18 @@ export def print-dep-usage [
       print $"(ansi dark_gray)[?] from glob imports(ansi reset)"
       for s in $seeds_maybe {
         let c = (_fq_canon $s)
-        let leaf = (_leaf $s)
-        let root_lbl = $"(ansi white)($leaf)(ansi reset)  (ansi dark_gray)[($s)](ansi reset)"
-        let lines = (_render_callers_tree $c $max_depth $callers $canon2real $root_lbl)
-        for ln in $lines { print $ln }
+        if ($reverse | default false) {
+          let leaf = (_leaf $s)
+          let root_lbl = $"(ansi white)($leaf)(ansi reset)  (ansi dark_gray)[($s)](ansi reset)"
+          let lines = (_render_callers_tree $c $max_depth $callers $canon2real $root_lbl)
+          for ln in $lines { print $ln }
+        } else {
+          let leaf = (_leaf $s)
+          print $"(ansi white)($leaf)(ansi reset)  (ansi dark_gray)[($s)](ansi reset)"
+          let forest = (_build_inverted_callers_forest $callers $c $max_depth)
+          let lines  = (_render_callers_forest_inverted $forest $canon2real $c)
+          for ln in $lines { print $ln }
+        }
         print ""
       }
     }

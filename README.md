@@ -105,7 +105,7 @@ Builds a **nested** tree of minimal nodes for pretty printing:
 { kind, name, fqpath, children: [ ... ] }
 ```
 
-### `print-symbol-tree [--fq-branches] [--tokens]`
+### `rust-print-symbol-tree [--fq-branches] [--tokens]`
 Pretty-prints the nested tree with aligned columns:
 
 - **Name** (ASCII tree branches + colorized name)
@@ -115,6 +115,24 @@ Pretty-prints the nested tree with aligned columns:
 - Token sub-columns are **right-aligned** per number so all counts line up.
 
 Color is applied via `_paint-kind` using `ansi`. All alignment uses `_vlen`, which strips ANSI before measuring. Works even if your terminal doesn’t support color.
+
+### `rust-print-call-graph <pattern> [--max-depth N] [--reverse] [--show-roots]`
+Visualizes function call relationships as a tree.
+
+- Useful for answering the question: **_"What codepaths could be traversed whenever X is called?"_**
+- `--reverse:` Bottom-up callers view. Start from target and walk upward through its parents.
+- `--max-depth:` Limit traversal depth (default: 3).
+- `--show-roots:` Print a one-line header describing the direction and depth.
+
+### `rust-print-dep-usage [dep?] [--max-depth N] [--include-maybe] [--records]`
+Analyze how external dependencies are **used in your codebase** and visualize their call graph impact.
+
+- **`dep?`**: Optional crate name to focus on (case-insensitive). If omitted, all detected dependencies are shown.  
+- `--reverse:` Bottom-up callers view. Start from target and walk upward through its parents.
+- `--max-depth`: Limit call graph depth (default: 4).  
+- `--include-maybe`: Include heuristic matches from glob imports (e.g., `use foo::*;`).  
+- `--records`: Output as structured Nushell records (instead of colorized text). Useful for post-processing with `where`, `get`, `select`, etc.
+
 
 ---
 
@@ -146,7 +164,7 @@ Reload your shell.
 
 ## 🧪 Examples
 
-### 1) Explore call relationships
+### 1. Explore call relationships
 
 ```nu
 rust-ast |
@@ -155,7 +173,7 @@ rust-ast |
   sort-by fqpath
 ```
 
-### 2) Inspect docs and bodies for a specific function
+### 2. Inspect docs and bodies for a specific function
 
 ```nu
 rust-ast |
@@ -180,7 +198,7 @@ rust-ast |
 ╰──────┴──────────────────────────────────────────────────────────────────────────────┴───────────────┴─────────────────────────────────────────────────────────────────────────────────────────────┴───────────────
 ````
 
-### 3) Show signatures and body token counts
+### 3. Show signatures and body token counts
 
 ```nu
 rust-ast |
@@ -195,14 +213,14 @@ rust-ast |
 ╰───┴────────────────────────────────────────────────────────────────────────────────────────┴─────────────╯
 ```
 
-### 4) Print a **colorized** symbol tree
+### 4. Print a **colorized** symbol tree
 
 ```nu
-rust-tree | print-symbol-tree
+rust-tree | rust-print-symbol-tree
 ```
-![Print Symbol Tree Screenshot](./print-symbol-tree.png)
+![Print Symbol Tree Screenshot](./rust-print-symbol-tree.png)
 
-### 5) Take advantage of **Nushell's built in regex matching** inside queries
+### 5. Take advantage of **Nushell's built in regex matching** inside queries
 
 ```nu
  rust-ast |
@@ -225,10 +243,76 @@ rust-tree | print-symbol-tree
 ╰───┴────────────────────────────────────────────────────────────┴─────────────╯
 ```
 
-### 6) Show **token counts** with aligned sub-columns in the symbol tree
+### 6. Show **token counts** with aligned sub-columns in the symbol tree
 
 ```nu
-rust-tree | print-symbol-tree --tokens
+rust-tree | rust-print-symbol-tree --tokens
+```
+
+### 7. Explore call graphs
+
+Default callers view:
+```nu
+rust-print-call-graph crate::api::prepare_messages --max-depth 5 --show-roots
+```
+
+Bottom-up callers view:
+```nu
+rust-print-call-graph crate::api::prepare_messages --reverse --max-depth 5 --show-roots
+```
+
+### 8. Find all call sites where external dependencies are used
+
+Example (text view):
+```nu
+rust-print-dep-usage crossterm --max-depth 5 --include-maybe
+```
+```text
+Dependency usage: crossterm
+direct references
+interactive_mode  [crate::api::interactive_mode]
+   |- handle_interactive_command  [crate::handle_interactive_command]
+      `- run  [crate::run]
+         `- main  [crate::main]
+
+[?] from glob imports
+ask  [crate::api::ask]
+   `- handle_ask_command  [crate::handle_ask_command]
+      `- run  [crate::run]
+         `- main  [crate::main]
+```
+
+Example (text view, reversed):
+```nu
+rust-print-dep-usage crossterm --max-depth 5 --include-maybe --reverse
+```
+```text
+Dependency usage: crossterm
+direct references
+interactive_mode  [crate::api::interactive_mode]
+   |- handle_interactive_command  [crate::handle_interactive_command]
+      `- run  [crate::run]
+         `- main  [crate::main]
+
+[?] from glob imports
+ask  [crate::api::ask]
+   `- handle_ask_command  [crate::handle_ask_command]
+      `- run  [crate::run]
+         `- main  [crate::main]
+```
+
+Example (records view):
+```nu
+rust-print-dep-usage --max-depth 5 --include-maybe --records
+```
+```text
+╭───┬────────────┬───────────────┬──────────────────────────────────────────────╮
+│ # │   crate    │   category    │                   symbol                     │
+├───┼────────────┼───────────────┼──────────────────────────────────────────────┤
+│ 0 │ crossterm  │ direct        │ crate::api::interactive_mode                 │
+│ 1 │ crossterm  │ maybe (glob)  │ crate::api::ask                              │
+│ 2 │ diesel     │ direct        │ crate::session_messages::SessionMessages::…  │
+╰───┴────────────┴───────────────┴──────────────────────────────────────────────╯
 ```
 
 ---
@@ -237,15 +321,16 @@ rust-tree | print-symbol-tree --tokens
 
 Use it to:
 
-- **Debug** complex relationships (trait impls, method resolution)
-- **Generate docs** from raw source
-- **Analyze structure** for refactors and performance work
+- **Debug** complex relationships (trait impls, method resolution).
+- **Generate docs** from raw source.
+- **Analyze structure** for refactors and performance work.
+- **Revive a Rust project** that won't build and thus cannot make use of `rust-analyzer`.
 
 It helps answer the questions:
 
-> "What is this?", "Where did it come from?", "What does it do?", "Is it documented?", "What’s it related to?"
+> "What is this?", "Where did it come from?", "What does it do?", "Is it documented?", "What’s it related to?", "How do we remove it?"
 
-…with actionable metadata.
+with actionable metadata.
 
 ---
 
@@ -255,6 +340,9 @@ It helps answer the questions:
 - **Module Paths:** File-based `mod` rows reflect filesystem layout, not necessarily `use` resolution.
 - **ANSI:** We color via Nushell’s `ansi` command. Spacing is computed on **stripped** strings, so alignment holds even with color.
 - **Token counts:** Heuristic by default unless you wire up `_token-count-via-tiktoken`.
+- **Inverted callers view**: avoids explosion by stopping at known roots.
+- **Cyclical dependencies**: Cycles are marked with (⟲ cycle).
+  - Duplicate expansions are skipped once visited.
 
 ---
 
