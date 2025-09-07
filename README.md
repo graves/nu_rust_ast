@@ -270,16 +270,18 @@ rust-print-dep-usage crossterm --max-depth 5 --include-maybe
 ```text
 Dependency usage: crossterm
 direct references
-interactive_mode  [crate::api::interactive_mode]
-   |- handle_interactive_command  [crate::handle_interactive_command]
-      `- run  [crate::run]
-         `- main  [crate::main]
+interactive_mode  [crate::api::interactive_mode] uses: cursor::position
+main  [crate::main]
+   `- run  [crate::run]
+      `- handle_interactive_command  [crate::handle_interactive_command]
+         `- interactive_mode  [crate::api::interactive_mode]
 
 [?] from glob imports
-ask  [crate::api::ask]
-   `- handle_ask_command  [crate::handle_ask_command]
-      `- run  [crate::run]
-         `- main  [crate::main]
+interactive_mode  [crate::api::interactive_mode]
+main  [crate::main]
+   `- run  [crate::run]
+      `- handle_interactive_command  [crate::handle_interactive_command]
+         `- interactive_mode  [crate::api::interactive_mode]
 ```
 
 Example (text view, reversed):
@@ -289,16 +291,16 @@ rust-print-dep-usage crossterm --max-depth 5 --include-maybe --reverse
 ```text
 Dependency usage: crossterm
 direct references
-interactive_mode  [crate::api::interactive_mode]
-   |- handle_interactive_command  [crate::handle_interactive_command]
-      `- run  [crate::run]
-         `- main  [crate::main]
+interactive_mode  [crate::api::interactive_mode] uses: cursor::position
+`- handle_interactive_command  [crate::handle_interactive_command]
+   `- run  [crate::run]
+      `- main  [crate::main]
 
 [?] from glob imports
-ask  [crate::api::ask]
-   `- handle_ask_command  [crate::handle_ask_command]
-      `- run  [crate::run]
-         `- main  [crate::main]
+interactive_mode  [crate::api::interactive_mode]
+`- handle_interactive_command  [crate::handle_interactive_command]
+   `- run  [crate::run]
+      `- main  [crate::main]
 ```
 
 Example (records view):
