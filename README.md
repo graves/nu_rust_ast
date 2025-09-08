@@ -255,10 +255,50 @@ Default callers view:
 ```nu
 rust-print-call-graph crate::api::prepare_messages --max-depth 5 --show-roots
 ```
+```text
+Call graph depth: 5 ← callers crate::api::prepare_messages
+test_prepare_messages  [crate::api::test_prepare_messages]
+|  `- prepare_messages  [crate::api::prepare_messages]
+main  [crate::main]
+   `- run  [crate::run]
+      |- handle_ask_command  [crate::handle_ask_command]
+      |  `- ask  [crate::api::ask]
+      |     `- get_session_messages  [crate::api::get_session_messages]
+      |        |- prepare_messages  [crate::api::prepare_messages]
+      |        `- prepare_messages_for_existing_session  [crate::api::prepare_messages_for_existing_session]
+      |           `- prepare_messages  [crate::api::prepare_messages]
+      `- handle_interactive_command  [crate::handle_interactive_command]
+         `- interactive_mode  [crate::api::interactive_mode]
+            `- get_session_messages  [crate::api::get_session_messages]
+               |- prepare_messages  [crate::api::prepare_messages]
+               `- prepare_messages_for_existing_session  [crate::api::prepare_messages_for_existing_session]
+````
 
 Bottom-up callers view:
 ```nu
 rust-print-call-graph crate::api::prepare_messages --reverse --max-depth 5 --show-roots
+```
+```
+Call graph depth: 5 ← callers (inverted) crate::api::prepare_messages
+prepare_messages  [crate::api::prepare_messages]
+|- get_session_messages  [crate::api::get_session_messages]
+|  |- ask  [crate::api::ask]
+|  |  `- handle_ask_command  [crate::handle_ask_command]
+|  |     `- run  [crate::run]
+|  |        `- main  [crate::main]
+|  `- interactive_mode  [crate::api::interactive_mode]
+|     `- handle_interactive_command  [crate::handle_interactive_command]
+|        `- run  [crate::run]
+|           `- main  [crate::main]
+|- prepare_messages_for_existing_session  [crate::api::prepare_messages_for_existing_session]
+|  `- get_session_messages  [crate::api::get_session_messages]
+|     |- ask  [crate::api::ask]
+|     |  `- handle_ask_command  [crate::handle_ask_command]
+|     |     `- run  [crate::run]
+|     `- interactive_mode  [crate::api::interactive_mode]
+|        `- handle_interactive_command  [crate::handle_interactive_command]
+|           `- run  [crate::run]
+`- test_prepare_messages  [crate::api::test_prepare_messages]
 ```
 
 ### 8. Find all call sites where external dependencies are used

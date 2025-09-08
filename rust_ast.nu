@@ -238,6 +238,14 @@
 #
 # =============================================================================
 export def rust-ast [...paths:string] {
+  _ensure-caches
+  # 0) Precompute inline-mod index once (files under src/ only; fast)
+  let files_all = (_list-rust-files ...$paths)
+  let files_src = ($files_all | where {|p| $p | path split | any {|seg| $seg == 'src' }})
+  let idx = (_build-inline-mods-index $files_src)
+  _inline-idx-set $idx  
+
+  # 1) then do the normal harvest
   [
     (rust-fn-records ...$paths)
     (rust-extern-fn-records ...$paths)
@@ -245,6 +253,7 @@ export def rust-ast [...paths:string] {
     (rust-enum-records ...$paths)
     (rust-type-records ...$paths)
     (rust-trait-records ...$paths)
+    (rust-trait-method-records ...$paths)
     (rust-impl-records ...$paths)
     (rust-mod-records ...$paths)
     (rust-file-mod-records ...$paths)
@@ -256,39 +265,41 @@ export def rust-ast [...paths:string] {
   | flatten
   | _attach_impl_to_fns
   | _uniq-records
+  | _uniq-by-kind-fqpath
   | _attach_callers
 }
 
 # # Nested structure of symbols — MINIMAL payload (kind, name, fqpath, children).
 # This is exactly what `rust-print-symbol-tree` expects to render/align/paint columns.
+# replace the body of rust-tree with this version
 export def rust-tree [
   ...paths:string
   --include-use
 ] {
-  let rows_all  = (rust-ast ...$paths)
+  _ensure-caches
+  let piped = $in
+
+  # If we got rows via the pipe, use them; else harvest now.
+  let rows_all = (
+    if (( $piped | describe ) =~ '^(list|table)')
+       and (not ($piped | is-empty))
+       and (($piped | first | describe) =~ '^record<')
+    { $piped } else { rust-ast ...$paths }
+  )
+
   let rows_base = if $include_use { $rows_all } else { $rows_all | where kind != 'use' }
 
-  # Build parent→children adjacency and a minimal index
   let edges = (_build-symbol-edges $rows_base)
   let idx   = (_rows-index $rows_base)
 
-  # Build minimal children under 'crate'
   let root_kids_fq = (_children-for $edges 'crate')
-  let root_kids    = (
+  let root_kids = (
     $root_kids_fq
     | each {|cfq| _build-subtree $idx $edges $cfq }
     | where {|x| (($x | describe) =~ '^record<') }
   )
 
-  # Minimal root record for output (only one list-typed column: `children`)
-  let root_rec = {
-    kind: 'mod'
-    name: 'crate'
-    fqpath: 'crate'
-    children: $root_kids
-  }
-
-  [ $root_rec ]
+  [{ kind: 'mod', name: 'crate', fqpath: 'crate', children: $root_kids }]
 }
 
 # =============================================================================
@@ -518,15 +529,41 @@ def _sigline [text: string] {
 
 # Run ast-grep safely (returns error if neither `sg` nor `ast-grep`) works.
 def _run_sg [...args:string] {
-  try {
-    ^sg ...$args
-  } catch {
-    try {
-      ^ast-grep ...$args
-    } catch {
-      error make -u { msg: "ast-grep (`sg`/`ast-grep`) not found or failed", label: { text: (['sg' 'ast-grep'] | str join ' / ') } }
+  _dbg $"sg args: ( $args | str join ' ' )"
+  try { ^sg ...$args } catch {
+    try { ^ast-grep ...$args } catch {
+      error make -u { msg: "ast-grep (`sg`/`ast-grep`) not found or failed"
+                     , label: { text: (['sg' 'ast-grep'] | str join ' / ') } }
     }
   }
+}
+
+def _sg_json [pattern:string, ...paths:string] {
+  let target = (_target-list ...$paths)
+  let key = $"json|( $pattern )|( $target | str join '|' )"
+  let hit = (_sg_cache_get $key)
+  if $hit != null { return $hit }
+
+  _dbg $"_sg_json: pattern='($pattern)' files=( $target | length )"
+  let out = (_run_sg 'run' '-l' 'rust' '-p' $pattern '--json=stream' '--heading=never' '--color=never' ...$target)
+    | _parse_sg_json
+
+  _sg_cache_put $key $out
+  out
+}
+
+def _sg_json_on [pattern:string, targets:list<string>] {
+  let files = ($targets | where {|f| ($f | default null) != null } | uniq)
+  let key = $"json_on|( $pattern )|( $files | str join '|' )"
+  let hit = (_sg_cache_get $key)
+  if $hit != null { return $hit }
+
+  _dbg $"_sg_json_on: pattern='($pattern)' files=( $files | length )"
+  let out = (_run_sg 'run' '-l' 'rust' '-p' $pattern '--json=stream' '--heading=never' '--color=never' ...$files)
+    | _parse_sg_json
+
+  _sg_cache_put $key $out
+  $out
 }
 
 # Parse ast-grep --json=stream output into a flat list of records.
@@ -555,13 +592,6 @@ def _parse_sg_json [] {
   }
 }
 
-# Convenience wrappers for sg that always return parsed records.
-def _sg_json [pattern:string, ...paths:string] {
-  let target = (_target-list ...$paths)
-  (_run_sg 'run' '-l' 'rust' '-p' $pattern '--json=stream' '--heading=never' '--color=never' ...$target)
-  | _parse_sg_json
-}
-
 def _sg_rewrite [pattern:string, rewrite:string, ...paths:string] {
   let target = (_target-list ...$paths)
   (_run_sg 'run' '-l' 'rust' '-p' $pattern '-r' $rewrite '--json=stream' '--heading=never' '--color=never' ...$target)
@@ -578,20 +608,42 @@ def _sg_text [pattern:string, ...paths:string] {
   | default []
 }
 
-# Versions that accept an already-expanded list of file targets.
-def _sg_json_on [pattern:string, targets:list<string>] {
-  (_run_sg 'run' '-l' 'rust' '-p' $pattern '--json=stream' '--heading=never' '--color=never' ...$targets)
-  | _parse_sg_json
-}
-
 def _sg_rewrite_on [pattern:string, rewrite:string, targets:list<string>] {
-  (_run_sg 'run' '-l' 'rust' '-p' $pattern '-r' $rewrite '--json=stream' '--heading=never' '--color=never' ...$targets)
-  | _parse_sg_json
+  let files = ($targets | uniq)
+  mut out = []
+  for f in $files {
+    let key = $"(($f | path expand))|REWRITE|($pattern)|($rewrite)"
+    if (_seen-has $key) { continue }
+    _seen-add $key
+    let cnt = (_bump-file-count $f)
+    if $cnt > (_scan_cap) {
+      error make { msg: "loop guard tripped"
+                 , label: { text: $"too many ast-grep runs for ($f)" } }
+    }
+    let rows = (_run_sg 'run' '-l' 'rust' '-p' $pattern '-r' $rewrite '--json=stream' '--heading=never' '--color=never' $f
+                | _parse_sg_json)
+    $out = ($out | append $rows)
+  }
+  $out | reduce -f [] {|b,a| $a | append $b }
 }
 
 def _sg_text_on [pattern:string, targets:list<string>] {
-  (_run_sg 'run' '-l' 'rust' '-p' $pattern '--json=stream' '--heading=never' '--color=never' ...$targets)
-  | _parse_sg_json
+  let files = ($targets | uniq)
+  mut out = []
+  for f in $files {
+    let key = $"(($f | path expand))|TEXT|($pattern)"
+    if (_seen-has $key) { continue }
+    _seen-add $key
+    let cnt = (_bump-file-count $f)
+    if $cnt > (_scan_cap) {
+      error make { msg: "loop guard tripped"
+                 , label: { text: $"too many ast-grep runs for ($f)" } }
+    }
+    let rows = (_run_sg 'run' '-l' 'rust' '-p' $pattern '--json=stream' '--heading=never' '--color=never' $f
+                | _parse_sg_json)
+    $out = ($out | append $rows)
+  }
+  $out | reduce -f [] {|b,a| $a | append $b }
 }
 
 # Map many (pattern,rewrite) pairs through sg -r and flatten unique results.
@@ -673,6 +725,65 @@ def _extract-rustdoc [raw: record] {
   }
 
   ($acc | str join "\n")
+}
+
+# All inline (in-file) modules in a file, with byte spans
+# module-global-ish cache via env (Nu allows env mutation)
+def _inline-mods-in-file [file:string] {
+  let f = ($file | path expand)
+
+  # fast path: cache hit
+  let cached = (try { $env.__INLINE_MODS_CACHE | get $f } catch { null })
+  if $cached != null { return $cached }
+
+  # slow path: compute once
+  let pats = [ 'mod $N { $$$B }', 'pub mod $N { $$$B }' ]
+  mut out = []
+  for p in $pats {
+    let rows = (_sg_json_on $p [ $f ])
+      | each {|raw|
+          let name = ($raw.metaVariables.single?.N.text | default null)
+          if $name == null { null } else {
+            {
+              name:  $name
+              file:  ($raw.file | into string)
+              start: ($raw.range.byteOffset.start | default 0)
+              end:   ($raw.range.byteOffset.end   | default 0)
+            }
+          }
+        }
+      | where {|x| $x != null }
+    $out = ($out | append $rows)
+  }
+
+  let res = (
+    $out
+    | reduce -f [] {|batch, acc| $acc | append $batch }
+    | sort-by {|m| ($m.end - $m.start) }  # outermost first
+  )
+
+  # store in cache
+  load-env {
+    __INLINE_MODS_CACHE: (
+      ($env.__INLINE_MODS_CACHE | default {} )
+      | upsert $f $res
+    )
+  }
+
+  res
+}
+
+# Return the inline module chain (outer → inner) that strictly encloses [s,e) in file
+def _enclosing-inline-mods [file:string, s:int, e:int] {
+  let f = ($file | path expand)
+  let spans = (_inline-idx-get $f)
+  if $spans == null { [] } else {
+    $spans
+    | where {|m| ($m.start < $s) and ($m.end > $e) }
+    | sort-by {|m| ($m.end - $m.start) }
+    | get -i name
+    | default []
+  }
 }
 
 # Crate/file inner docs at the top of a file (//! or /*! ... */), verbatim.
@@ -1006,6 +1117,62 @@ def _resolve-call [
   null
 }
 
+# Build once per session; safe no-op if built again
+def _build-inline-mods-index [files:list<string>] {
+  let pats = [ 'mod $N { $$$B }' 'pub mod $N { $$$B }' ]
+  mut out = {}
+  for f in ($files | uniq) {
+    mut acc = []
+    for p in $pats {
+      let rows = (
+        _sg_json_on $p [ $f ]
+        | each {|raw|
+            let n = ($raw.metaVariables.single?.N.text | default null)
+            if $n == null { null } else {
+              {
+                name:  $n
+                file:  ($raw.file | into string)
+                start: ($raw.range.byteOffset.start | default 0)
+                end:   ($raw.range.byteOffset.end   | default 0)
+              }
+            }
+          }
+        | where {|x| $x != null }
+      )
+      $acc = ($acc | append $rows)
+    }
+    let spans = (
+      $acc
+      | reduce -f [] {|batch, a| $a | append $batch }
+      | sort-by {|m| $m.end - $m.start }  # outermost-first
+    )
+    $out = ($out | upsert ($f | path expand) $spans)
+  }
+  $out
+}
+
+# predicate: does the env var exist?
+def _has-env [name:string] {
+  $env | columns | any {|c| $c == $name }
+}
+
+# setter: mutate env (portable)
+export def --env _inline-idx-set [idx: record] {
+  load-env { __INLINE_IDX: $idx }
+}
+
+# getter: read from env if present
+def _inline-idx-get [file:string] {
+  if not (_has-env "__INLINE_IDX") { null } else {
+    try { $env.__INLINE_IDX | get ($file | path expand) } catch { null }
+  }
+}
+
+# Read helper (side-effect free)
+def _inline_idx_get [file:string] {
+  try { $env.__INLINE_IDX | get ($file | path expand) } catch { null }
+}
+
 # ---- record builder / deduper -----------------------------------------------
 
 def _mk-record [
@@ -1017,7 +1184,28 @@ def _mk-record [
   let crate = (_cargo-crate-name)
   let file  = ($raw.file | default '')
   let text  = ($raw.text | default '')
-  let modp  = (_module-path-from-file $file)
+
+  # existing file-derived module path (src/a/b.rs → ["a","b"])
+  let modp_fs  = (_module-path-from-file $file)
+
+  # NEW: inline module chain inside the same file (e.g., ["sealed"])
+  let s_byte = ($raw.range.byteOffset.start | default 0)
+  let e_byte = ($raw.range.byteOffset.end   | default 0)
+  let is_mod = ($kind == 'mod')
+
+  def _is-under-src [file:string] {
+    $file | path split | any {|seg| $seg == 'src' }
+  }
+
+  # in _mk-record, just before computing modp_inline:
+  let modp_inline = (
+    if (not (_is-under-src $file)) or ($kind == 'mod') { [] } 
+    else { _enclosing-inline-mods $file $s_byte $e_byte }
+  )
+
+  # combine: filesystem path + inline modules
+  let modp = ($modp_fs | append $modp_inline)
+
   let hasb  = (_has-body $text)
   let sig   = (_sigline $text)
   let vis   = (_visibility-of $sig)
@@ -1030,6 +1218,7 @@ def _mk-record [
   let gens  = ($single | get -i G   | default {} | get -i text | default null)
   let where_txt = ($single | get -i W | default {} | get -i text | default null)
 
+  # FQ path now respects inline modules
   let fq = if ($name | is-empty) { '' } else {
     if ($modp | is-empty) { $"crate::($name)" } else { $"crate::($modp | str join '::')::($name)" }
   }
@@ -1050,8 +1239,8 @@ def _mk-record [
     span: {
       start_line: ($raw.range.start.line | default null)
       end_line:   ($raw.range.end.line   | default null)
-      start_byte: ($raw.range.byteOffset.start | default null)
-      end_byte:   ($raw.range.byteOffset.end   | default null)
+      start_byte: $s_byte
+      end_byte:   $e_byte
     }
     attrs: []
     signature: $sig
@@ -1221,20 +1410,30 @@ def _expand-grouped-use [src_text:string] {
 def _list-rust-files [...paths:string] {
   let targets = (_target-list ...$paths)
 
-  $targets
-  | each {|t|
-      let p = ($t | path expand)
-      let typ = (try { $p | path type } catch { null })
+  let files = (
+    $targets
+    | each {|t|
+        let p = ($t | path expand)
+        let typ = (try { $p | path type } catch { null })
+        if $typ == 'file' {
+          if ($p | str ends-with '.rs') { [$p] } else { [] }
+        } else if $typ == 'dir' or $typ == null {
+          try { glob $"($p)/**\/*.rs" } catch { [] }
+        } else { [] }
+      }
+    | flatten
+    # TEMP: exclude heavy dirs
+    | where {|f| not ($f | str contains "/target/") }
+    | where {|f| not ($f | str contains "/vendor/") }
+    | where {|f| not ($f | str contains "/.git/") }
+    | sort | uniq
+  )
 
-      if $typ == 'file' {
-        if ($p | str ends-with '.rs') { [$p] } else { [] }
-      } else if $typ == 'dir' or $typ == null {
-        try { glob $"($p)/**\/*.rs" } catch { [] }
-      } else { [] }
-    }
-  | flatten
-  | sort
-  | uniq
+  _dbg $"files: ( $files | length )"
+  # Optional: peek a few paths
+  _dbg $"first 5: ( $files | first 5 | str join ', ' )"
+
+  $files
 }
 
 # ---------- collectors per kind ---------------------------------------------
@@ -1373,41 +1572,80 @@ export def rust-extern-fn-records [...paths:string] {
   $out | reduce -f [] {|batch, acc| $acc | append $batch } | _uniq-records
 }
 
-# Structs
+# Structs (handles generics, tuple/unit, where-clauses, and common vis forms)
+# Structs — braced / tuple / unit
+# - Explicit generic vs non-generic variants (no <$G>?).
+# - Allow where-clauses only on braced forms (tuple/unit+where caused ERROR nodes).
 export def rust-struct-records [...paths:string] {
   let targets = (_target-list ...$paths)
+
   let pats = [
-    'pub struct $N { $$$F }'
-    'struct $N { $$$F }'
-    'pub struct $N<$G>? { $$$B }'
-    'struct $N<$G>? { $$$B }'
-    'pub struct $N<$G>?($$$F);'
-    'struct $N<$G>?($$$F);'
-    'pub struct $N<$G>?;'
-    'struct $N<$G>?;'
+    # ---------- braced ----------
+    'struct $N { $$$F }',
+    'pub struct $N { $$$F }',
+    'struct $N<$G> { $$$F }',
+    'pub struct $N<$G> { $$$F }',
+    'struct $N where $W { $$$F }',
+    'pub struct $N where $W { $$$F }',
+    'struct $N<$G> where $W { $$$F }',
+    'pub struct $N<$G> where $W { $$$F }',
+
+    # ---------- tuple ----------
+    'struct $N($$$F);',
+    'pub struct $N($$$F);',
+    'struct $N<$G>($$$F);',
+    'pub struct $N<$G>($$$F);',
+
+    # ---------- unit ----------
+    'struct $N;',
+    'pub struct $N;',
+    'struct $N<$G>;',
+    'pub struct $N<$G>;',
   ]
+
   mut out = []
   for p in $pats {
-    let want_body = ($p | str contains '{')
+    let want_body = ($p | str contains '{')    # only braced structs capture body_text
     let rows = (_sg_json_on $p $targets | each {|raw| _mk-record 'struct' $raw $want_body })
     $out = ($out | append $rows)
   }
-  $out | reduce -f [] {|batch, acc| $acc | append $batch } | _uniq-records
+
+  $out
+  | reduce -f [] {|batch, acc| $acc | append $batch }
+  | _uniq-records
 }
 
-# Enums
+# Enums — cover: no generics, generics, where, generics+where.
 export def rust-enum-records [...paths:string] {
   let targets = (_target-list ...$paths)
+
   let pats = [
-    'pub enum $N$G? { $$$V }'
-    'enum $N$G? { $$$V }'
+    # no generics
+    'enum $N { $$$V }',
+    'pub enum $N { $$$V }',
+
+    # generics
+    'enum $N<$G> { $$$V }',
+    'pub enum $N<$G> { $$$V }',
+
+    # where (on the enum itself)
+    'enum $N where $W { $$$V }',
+    'pub enum $N where $W { $$$V }',
+
+    # generics + where
+    'enum $N<$G> where $W { $$$V }',
+    'pub enum $N<$G> where $W { $$$V }',
   ]
+
   mut out = []
   for p in $pats {
     let rows = (_sg_json_on $p $targets | each {|raw| _mk-record 'enum' $raw true })
     $out = ($out | append $rows)
   }
-  $out | reduce -f [] {|batch, acc| $acc | append $batch } | _uniq-records
+
+  $out
+  | reduce -f [] {|batch, acc| $acc | append $batch }
+  | _uniq-records
 }
 
 # Type aliases
@@ -1426,20 +1664,86 @@ export def rust-type-records [...paths:string] {
 }
 
 # Traits
+# Traits (now matches supertraits and optional where-clauses)
 export def rust-trait-records [...paths:string] {
   let targets = (_target-list ...$paths)
+
   let pats = [
+    # no generics, no supertrait
     'pub unsafe trait $N { $$$B }'
     'pub trait $N { $$$B }'
     'unsafe trait $N { $$$B }'
     'trait $N { $$$B }'
+
+    # no generics, WITH supertrait
+    'pub unsafe trait $N: $T { $$$B }'
+    'pub trait $N: $T { $$$B }'
+    'unsafe trait $N: $T { $$$B }'
+    'trait $N: $T { $$$B }'
+
+    # no generics, WITH where
+    'pub unsafe trait $N where $W { $$$B }'
+    'pub trait $N where $W { $$$B }'
+    'unsafe trait $N where $W { $$$B }'
+    'trait $N where $W { $$$B }'
+
+    # no generics, WITH supertrait + where
+    'pub unsafe trait $N: $T where $W { $$$B }'
+    'pub trait $N: $T where $W { $$$B }'
+    'unsafe trait $N: $T where $W { $$$B }'
+    'trait $N: $T where $W { $$$B }'
+
+    # generics (optional), no supertrait
+    'pub unsafe trait $N<$G>? { $$$B }'
+    'pub trait $N<$G>? { $$$B }'
+    'unsafe trait $N<$G>? { $$$B }'
+    'trait $N<$G>? { $$$B }'
+
+    # generics (optional), WITH supertrait
+    'pub unsafe trait $N<$G>?: $T { $$$B }'
+    'pub trait $N<$G>?: $T { $$$B }'
+    'unsafe trait $N<$G>?: $T { $$$B }'
+    'trait $N<$G>?: $T { $$$B }'
+
+    # generics (optional), WITH where
+    'pub unsafe trait $N<$G>? where $W { $$$B }'
+    'pub trait $N<$G>? where $W { $$$B }'
+    'unsafe trait $N<$G>? where $W { $$$B }'
+    'trait $N<$G>? where $W { $$$B }'
+
+    # generics (optional), WITH supertrait + where
+    'pub unsafe trait $N<$G>?: $T where $W { $$$B }'
+    'pub trait $N<$G>?: $T where $W { $$$B }'
+    'unsafe trait $N<$G>?: $T where $W { $$$B }'
+    'trait $N<$G>?: $T where $W { $$$B }'
   ]
+
   mut out = []
   for p in $pats {
     let rows = (_sg_json_on $p $targets | each {|raw| _mk-record 'trait' $raw false })
     $out = ($out | append $rows)
   }
-  $out | reduce -f [] {|batch, acc| $acc | append $batch } | _uniq-records
+
+  $out
+  | reduce -f [] {|batch, acc| $acc | append $batch }
+  | _uniq-records
+}
+
+# Add this helper near _uniq-records
+def _uniq-by-kind-fqpath [rows?: list<record>] {
+  let r = if ($rows | is-empty) { $in } else { $rows }
+  $r
+  | where {|x| ($x | describe) =~ '^record<' }
+  | group-by {|x| [($x.kind | default ''), ($x.fqpath | default '')] | to json }
+  | values
+  # pick a stable representative (smallest span, then earliest line)
+  | each {|g|
+      $g
+      | sort-by {|x| [ ($x.span.end_byte | default 0) - ($x.span.start_byte | default 0)
+                      , ($x.span.start_line | default 0) ] }
+      | get 0
+    }
+  | sort-by file span.start_line
 }
 
 # impl blocks
@@ -1500,6 +1804,92 @@ export def rust-impl-records [...paths:string] {
   }
 
   $out | reduce -f [] {|batch, acc| $acc | append $batch } | _uniq-records
+}
+
+# Collect trait-impl methods efficiently:
+# - Reuse piped rows if present (no re-scan).
+# - Otherwise, for each file, harvest fns ONCE and slice by block span.
+export def rust-trait-method-records [...paths:string] {
+  let targets = (_target-list ...$paths)
+
+  # Prefer piped rows if present
+  let piped = $in
+  let piped_rows = (
+    if (( $piped | describe ) =~ '^(list|table)')
+       and (not ($piped | is-empty))
+       and (($piped | first | describe) =~ '^record<')
+    { $piped } else { null }
+  )
+
+  # Grab impl blocks once
+  let impl_pats = [
+    'impl $T for $S { $$$I }',
+    'impl<$G> $T for $S { $$$I }',
+    'impl $T for $S where $W { $$$I }',
+    'impl<$G> $T for $S where $W { $$$I }',
+  ]
+
+  let blocks = (
+    $impl_pats
+    | each {|ip|
+        _sg_json_on $ip $targets
+        | each {|b|
+            {
+              file: ($b.file | into string)
+              s: ($b.range.byteOffset.start | default 0)
+              e: ($b.range.byteOffset.end   | default 0)
+            }
+          }
+      }
+    | flatten
+    | sort-by file s e
+  )
+
+  if ($blocks | is-empty) { return [] }
+
+  # Group blocks by file so we harvest functions ONCE per file
+  let by_file = (
+    $blocks
+    | group-by file
+    | transpose file items
+  )
+
+  mut out = []
+
+  for bf in $by_file {
+    let file  = $bf.file
+    let spans = ($bf.items | select s e)
+
+    # Choose the function pool for this file:
+    # - prefer piped rows if present
+    # - else run rust-fn-records $file ONCE
+    let fns_in_file_all = if (($piped_rows | describe) =~ '^(list|table)') {
+      $piped_rows
+      | where kind == 'fn'
+      | where file == $file
+    } else {
+      rust-fn-records $file
+    }
+
+    if (not ($fns_in_file_all | is-empty)) {
+      for b in $spans {
+        let s = ($b.s | default 0)
+        let e = ($b.e | default 0)
+        let subset = (
+          $fns_in_file_all
+          | where {|it|
+              ((($it.span.start_byte | default 0) >= $s) and
+               (($it.span.end_byte   | default 0) <= $e))
+            }
+        )
+        if (not ($subset | is-empty)) {
+          $out = ($out | append $subset)
+        }
+      }
+    }
+  }
+
+  $out | _uniq-records
 }
 
 # Module syntax (inline and declarations)
@@ -1714,7 +2104,7 @@ def _paint-kind [kind:string, text:string] {
     "fn"         => $"(ansi green)($t)(ansi reset)"
     "extern_fn"  => $"(ansi light_green)($t)(ansi reset)"
     "struct"     => $"(ansi magenta)($t)(ansi reset)"
-    "enum"       => $"(ansi purple)($t)(ansi reset)"
+    "enum"       => $"(ansi light_purple)($t)(ansi reset)"
     "trait"      => $"(ansi cyan)($t)(ansi reset)"  # or 'purple' (alias)
     "impl"       => $"(ansi yellow)($t)(ansi reset)"
     "const"      => $"(ansi light_red)($t)(ansi reset)"
@@ -1775,12 +2165,17 @@ def _build-subtree [idx: record, edges: list<record>, fq: string] {
 
 # Build { fqpath -> { body_tokens:int, doc_tokens:int } }
 def _build-token-index [] {
-  rust-ast
+  let piped = $in
+  let rows = (
+    if (( $piped | describe ) =~ '^(list|table)')
+       and (not ($piped | is-empty))
+       and (($piped | first | describe) =~ '^record<')
+    { $piped } else { rust-ast }
+  )
+  $rows
   | reduce -f {} {|r, acc|
       let fq = ($r.fqpath | default '')
-      if $fq == '' {
-        $acc
-      } else {
+      if $fq == '' { $acc } else {
         $acc | upsert $fq {
           body_tokens: ($r.body_tokens | default 0)
           doc_tokens:  ($r.doc_tokens  | default 0)
@@ -2247,10 +2642,16 @@ def _render_callers_forest_inverted [
 export def rust-print-call-graph [
   pattern:string,
   --max-depth:int = 3,
-  --reverse,       # callers-of (bottom-up) when set; default: inverted callers (top-down to target)
+  --reverse,
   --show-roots,
 ] {
-  let rows = (rust-ast)
+  let piped = $in
+  let rows = (
+    if (( $piped | describe ) =~ '^(list|table)')
+       and (not ($piped | is-empty))
+       and (($piped | first | describe) =~ '^record<')
+    { $piped } else { rust-ast }
+  )
   let fns  = ($rows | where kind == 'fn')
 
   let seeds_real = (_lookup-fn-seeds $fns $pattern)
@@ -2881,4 +3282,80 @@ export def rust-print-dep-usage [
       }
     }
   }
+}
+
+# ---------- LOOP GUARDS (seen-set + per-file cap) ----------------------------
+
+# track (file|pattern) we've already run
+export def --env _seen-add [key:string] {
+  let m = (try { $env.__SEEN } catch { {} })
+  load-env { __SEEN: ($m | upsert $key true) }
+}
+
+def _seen-has [key:string] {
+  let m = (try { $env.__SEEN } catch { {} })
+  try { $m | get $key } catch { false }
+}
+
+# bump a per-file counter; bail out if it gets silly
+export def --env _bump-file-count [file:string] {
+  let f = ($file | path expand)
+  let m = (try { $env.__SCAN_COUNT } catch { {} })
+  let n = ((try { $m | get $f } catch { 0 }) + 1)
+  load-env { __SCAN_COUNT: ($m | upsert $f $n) }
+  $n
+}
+
+# how many sg runs will we allow per file this session?
+def _scan_cap [] {
+  ($env.RUST_AST_SCAN_CAP | default 500) | into int
+}
+
+# ---- small JSON-result cache (safe env access) ------------------------------
+
+def _sg_cache_get [k:string] {
+  let cur = (try { $env | get __SG_JSON_CACHE } catch { {} })
+  try { $cur | get $k } catch { null }
+}
+
+export def --env _sg_cache_put [k:string, v:any] {
+  let cur  = (try { $env | get __SG_JSON_CACHE } catch { {} })
+  let next = ($cur | upsert $k $v)
+  load-env { __SG_JSON_CACHE: $next }
+}
+
+export def --env _sg_cache_clear [] {
+  load-env { __SG_JSON_CACHE: {} }
+}
+
+export def --env _ensure-caches [] {
+  if (try { $env | get __SG_JSON_CACHE } catch { null }) == null {
+    load-env { __SG_JSON_CACHE: {} }
+  }
+  if (try { $env | get __INLINE_IDX } catch { null }) == null {
+    load-env { __INLINE_IDX: {} }
+  }
+  if (try { $env | get __INLINE_MODS_CACHE } catch { null }) == null {
+    load-env { __INLINE_MODS_CACHE: {} }
+  }
+}
+
+# Treat these as "true": 1, true, yes, on (case-insensitive)
+def _debug_enabled [] {
+  let raw = (_env_str 'RUST_AST_DEBUG' | str downcase | str trim)
+  match $raw {
+    "1" | "true" | "yes" | "on" => true
+    _ => false
+  }
+}
+
+def _dbg [msg:string] {
+  if (_debug_enabled) {
+    print $"(ansi dark_gray)[DBG](ansi reset) ($msg)"
+  }
+}
+
+def _env_str [name:string] {
+  # returns "" if the var is unset; always a string
+  (try { $env | get $name } catch { null }) | default '' | into string
 }
