@@ -177,7 +177,7 @@ rust-ast |
 
 ```nu
 rust-ast |
-  where kind == 'fn' and name == 'process_files' |
+  where kind == 'fn' and name == 'search' |
   select doc doc_tokens body_text body_tokens
 ```
 ```text
@@ -202,7 +202,7 @@ rust-ast |
 
 ```nu
 rust-ast |
-  where kind == 'fn' and name == 'process_files' |
+  where kind == 'fn' and name == 'search' |
   select signature body_tokens
 ```
 ```text
