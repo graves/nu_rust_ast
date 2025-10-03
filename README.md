@@ -44,7 +44,7 @@ Think of it as a Nushell-first *Rust AST explorer*. Perfect for reverse-engineer
 
 ## 🧠 Core Features
 
-### 1) Structured Symbol Tables
+### 1. Structured Symbol Tables
 
 Each row represents a Rust symbol with:
 
@@ -72,22 +72,22 @@ Each row represents a Rust symbol with:
 | `doc_tokens`         | Token estimate for `doc`                                                                                     |
 | `body_tokens`        | Token estimate for `body_text`                                                                               |
 
-### 2) `ast-grep` Integration
+### 2. `ast-grep` Integration
 
 - Uses `ast-grep --json=stream` to parse Rust
 - Patterns cover bodies, decls, generics, where clauses, etc.
 
-### 3) Optimized for Large Projects
+### 3. Optimized for Large Projects
 
 - Synthesizes “file module” rows for `src/foo.rs` / `src/foo/mod.rs`
 - Normalizes module paths directly from the filesystem layout
 
-### 4) Rustdoc & Token Counts
+### 4. Rustdoc & Token Counts
 
 - Extracts leading `///`, `#[doc = "..."]`, `/** ... */`, and file inner docs (`//!`, `/*! ... */`)
 - Token estimation mode configurable via `RUST_AST_TOKENIZER` (`words` default; `chars`; or `tiktoken` if you wire it up)
 
-### 5) Call Site Analysis
+### 5. Call Site Analysis
 
 - Finds simple call sites (`foo(...)`, `Type::foo(...)`, `recv.foo(...)`)
 - Attaches a `callers` list (as FQ paths) to function definitions
