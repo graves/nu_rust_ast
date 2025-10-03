@@ -1,5 +1,7 @@
 # =============================================================================
 # rust-ast toolkit — Harvest, analyze, and pretty-print Rust symbols & calls
+# Website: https://github.com/graves/nu_rust_ast
+# Maintained by: Thomas Gentry <thomas@awfulsec.com>
 # =============================================================================
 #
 # OVERVIEW
