@@ -1,0 +1,54 @@
+{
+  "root": ".",
+  "updated_at": "2025-10-06T04:09:21.680955Z",
+  "entries": [
+    {
+      "kind": "file",
+      "name": "README.md",
+      "path": "README.md",
+      "hash": "babc54c865508fa42dd34fad0f5b3d668e7d33c28ecfeb17c6654ec01b59ab92",
+      "updated_at": "2025-10-06T04:09:08.882031Z",
+      "doc": {
+        "fileDescription": "Documents a Nushell-powered CLI tool that extracts structured Rust symbol data for analysis and documentation.",
+        "joyThisFileBrings": 8,
+        "personalityEmoji": "🦣"
+      }
+    },
+    {
+      "kind": "file",
+      "name": "LICENSE",
+      "path": "LICENSE",
+      "hash": "b7a6a1ef44aa3647db780392b4fa023c613fd9fa482678bb7a729e5fe385ca00",
+      "updated_at": "2025-10-06T04:09:01.061056Z",
+      "doc": {
+        "fileDescription": "Serves as the legal license granting public domain dedication to the rust-ast project.",
+        "joyThisFileBrings": 7,
+        "personalityEmoji": "🐘"
+      }
+    },
+    {
+      "kind": "file",
+      "name": "rust-print-symbol-tree.png",
+      "path": "rust-print-symbol-tree.png",
+      "hash": "6044ab3d86b7c76563879c42a5454d27594012b7515a665c435938177b67307d",
+      "updated_at": "2025-10-06T04:09:17.672376Z",
+      "doc": {
+        "fileDescription": "Displays a visual hierarchy of Rust symbols extracted from a project's AST.",
+        "joyThisFileBrings": 8,
+        "personalityEmoji": "🐘"
+      }
+    },
+    {
+      "kind": "file",
+      "name": "rust_ast.nu",
+      "path": "rust_ast.nu",
+      "hash": "c3985904359f1f9c1007bffaa4d4568086c7c683e19284a302cf34b6fb2a4d42",
+      "updated_at": "2025-10-06T04:07:36.740821Z",
+      "doc": {
+        "fileDescription": "Extracts and structures Rust symbols for analysis within Nushell pipelines.",
+        "joyThisFileBrings": 9,
+        "personalityEmoji": "🦾"
+      }
+    }
+  ]
+}
