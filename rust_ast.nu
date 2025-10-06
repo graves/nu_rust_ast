@@ -892,6 +892,11 @@ def _rust-call-sites-on [targets:list<string>] {
     '$N($$$A)'
     '$Q::$N($$$A)'
     '$RECV.$N($$$A)'
+
+    # new: turbofish on the qualifier and/or on the function
+    '$Q::<$$$G>::$N($$$A)',
+    '$Q::$N::<$$$G>($$$A)',
+    '$RECV.$N::<$$$G>($$$A)'
   ]
 
   mut out = []
@@ -950,11 +955,20 @@ def _attach_callers [rows?: list<record>] {
     $calls
     | each {|c|
         let caller = (_enclosing-fn $fn_index $c.file ($c.span.start_byte | default 0) ($c.span.end_byte | default 0))
-        if $caller == null { null } else {
-          let target = (_resolve-call $idx $fns $c $caller)
-          if $target == null { null } else {
-            { callee_fq: ($target | get -i fqpath | default '')
-            , caller_fq: ($caller | get -i fqpath | default '') }
+        let target = (_resolve-call $idx $fns $c $caller)
+        if $target == null {
+          { callee_fq: $"( $c.qual | default '' )::( $c.callee )"
+          , caller_fq: ($caller | get -i fqpath | default '')
+          , maybe: true
+          , qual: ($c.qual | default '')
+          , callee: ($c.callee | default '')
+          }
+        } else {
+          { callee_fq: ($target | get -i fqpath | default '')
+          , caller_fq: ($caller | get -i fqpath | default '')
+          , maybe: false
+          , qual: ($c.qual | default '')
+          , callee: ($c.callee | default '')
           }
         }
       }
@@ -1976,101 +1990,111 @@ export def rust-static-records [...paths:string] {
 # use/import statements (one row per statement)
 export def rust-use-records [...paths:string] {
   let targets = (_target-list ...$paths)
-  let pats = ['pub use $$$I;' 'use $$$I;']
+
+  # also match pub(crate), pub(in …), etc.
+  let pats = ['pub use $$$I;' 'pub($$$V) use $$$I;' 'use $$$I;']
   mut out = []
 
   for p in $pats {
     let rows = (
       _sg_json_on $p $targets
       | each {|raw|
-          let file  = ($raw.file | into string)
-          let sline = ( ($raw.range.start.line | default 1) - 1 )
-          let eline =   ($raw.range.end.line   | default 1)
+          let file = ($raw.file | into string)
 
-          let src_block = (
-            try {
-              open $file
-              | into string
-              | lines
-              | skip $sline
-              | take ( ($eline - $sline + 1) | into int )
-              | str join "\n"
-            } catch { ($raw.text | into string) }
-          )
+          # Use the exact matched snippet from ast-grep.
+          mut stmt = ($raw.text | into string | str trim)
+          if ($stmt | is-empty) {
+            # very rare fallback
+            let sline = ( ($raw.range.start.line | default 1) - 1 )
+            let eline =   ($raw.range.end.line   | default 1)
+            let stmt = (
+              try {
+                open $file
+                | into string
+                | lines
+                | skip $sline
+                | take ( ($eline - $sline + 1) | into int )
+                | str join "\n"
+              } catch { "" }
+            ) | str trim
+          }
 
-          let from_use = (
-            $src_block
-            | str replace -ra '^(?s)\s*(#\[[^\]]*\]\s*)*' ''
-            | str replace -ra '^(?m:\s*//[^\n]*\n)+' ''
-            | str replace -ra '^(?s)\s*/\*.*?\*/\s*' ''
-            | str replace -ra '^(?s).*?\b(use\b.*)$' '$1'
-          )
+          if ($stmt | is-empty) { null } else {
+            # Normalize whitespace for downstream parsing
+            let stmt = ($stmt | str replace -ra '\s+' ' ' | str trim)
 
-          let upto_semi = (
-            $from_use
-            | str replace -ra '^(?s)(.*?;).*?$' '$1'
-            | str trim
-          )
+            # Strip leading visibility (`pub` or `pub(...)`) and trailing ';'
+            let body0 = (
+              $stmt
+              | str replace -ra '^\s*(pub\s*(\([^)]+\)\s*)?)?use\s+' ''
+              | str replace -ra '\s*;\s*$' ''
+              | str trim
+            )
 
-          if ($upto_semi | is-empty) or (not ($upto_semi | str contains 'use')) {
-            null
-          } else {
-            let stmt = ($upto_semi | str replace -ra '\s+' ' ' | str trim)
-
-            if ($stmt | str starts-with '///') or ($stmt | str starts-with '#[') {
+            if ($body0 == '' or $body0 == '}') {
               null
             } else {
-              let body0 = (
-                $stmt
-                | str replace -ra '^\s*(pub\s+)?use\s+' ''
-                | str replace -ra '\s*;\s*$' ''
-                | str trim
-              )
+              let is_grouped = ($body0 | str contains '{')
+              let modp       = (_module-path-from-file $file)
+              let crate_base = if ($modp | is-empty) { 'crate' } else { $"crate::($modp | str join '::')" }
 
-              if ($body0 == '' or $body0 == '}') { null } else {
-                let is_grouped = ($body0 | str contains '{')
-                let modp       = (_module-path-from-file $file)
-                let crate_base = if ($modp | is-empty) { 'crate' } else { $"crate::($modp | str join '::')" }
+              if $is_grouped {
+                let prefix0 = (
+                  $body0
+                  | str replace -ra '(?s)\{.*$' ''
+                  | str replace -ra '\s+' ''
+                  | str replace -ra '::$' ''
+                )
+                let base = if $prefix0 == 'crate' { $crate_base } else { $prefix0 }
 
-                if $is_grouped {
-                  let prefix0 = (
-                    $body0
-                    | str replace -ra '(?s)\{.*$' ''
-                    | str replace -ra '\s+' ''
-                    | str replace -ra '::$' ''
-                  )
-                  let base = if $prefix0 == 'crate' { $crate_base } else { $prefix0 }
+                (_mk-record 'use' $raw false '*')
+                | upsert signature $stmt
+                | upsert fqpath $"($base)::*"
+              } else {
+                let body_norm   = ($body0 | str replace -ra '\s+' ' ' | str trim)
+                let alias_parts = ($body_norm | split row ' as ')
+                let alias       = (if ($alias_parts | length) > 1 { $alias_parts | get 1 | str trim } else { null })
+                let path0       = ($alias_parts | get 0 | str replace -ra '\s+' '')
 
-                  (_mk-record 'use' $raw false '*')
-                  | upsert signature $stmt
-                  | upsert fqpath $"($base)::*"
+                let path     = if $path0 == 'crate' { $crate_base } else { $path0 }
+                let is_star  = ($path | str ends-with '::*')
+                let base_nm  = if $is_star { '*' } else { ($path | split row '::' | last) }
+                let name     = (if ($alias | default '' | str length) > 0 { $alias } else { $base_nm })
+
+                if ($name | is-empty) or $name == '}' {
+                  null
                 } else {
-                  let body_norm   = ($body0 | str replace -ra '\s+' ' ' | str trim)
-                  let alias_parts = ($body_norm | split row ' as ')
-                  let alias       = (if ($alias_parts | length) > 1 { $alias_parts | get 1 | str trim } else { null })
-                  let path0       = ($alias_parts | get 0 | str replace -ra '\s+' '')
-
-                  let path     = if $path0 == 'crate' { $crate_base } else { $path0 }
-                  let is_star  = ($path | str ends-with '::*')
-                  let base_nm  = if $is_star { '*' } else { ($path | split row '::' | last) }
-                  let name     = (if ($alias | default '' | str length) > 0 { $alias } else { $base_nm })
-
-                  if ($name | is-empty) or $name == '}' { null } else {
-                    (_mk-record 'use' $raw false $name)
-                    | upsert signature $stmt
-                    | upsert fqpath $path
-                  }
+                  (_mk-record 'use' $raw false $name)
+                  | upsert signature $stmt
+                  | upsert fqpath $path
                 }
               }
             }
           }
         }
-      )
       | where {|x| $x != null }
+    )
+
     $out = ($out | append $rows)
   }
 
-  $out | reduce -f [] {|batch, acc| $acc | append $batch } | _uniq-records
+  $out
+  | reduce -f [] {|batch, acc| $acc | append $batch }
+  | _uniq-records
+}
+
+# Quick finder for `use` leaves by name or path substring.
+export def rust-find-use [
+  needle:string,
+  ...paths:string
+] {
+  rust-use-records ...$paths
+  | where {|u|
+      let n = ($needle | str downcase)
+      ( ($u.name   | default '' | str downcase | str contains $n) ) or ( ($u.fqpath | default '' | str downcase | str contains $n) )
+    }
+  | select file span.start_line name fqpath signature
+  | sort-by file span.start_line
 }
 
 # ---------- nesting helpers (for rust-tree) ----------------------------------
